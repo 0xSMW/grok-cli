@@ -40,10 +40,10 @@ use grok_client::{
     ConversationResponse, DEFAULT_SPEECH_REFINEMENT_LEVEL, GrokAgentCustomization, GrokAsset,
     GrokAssetListOptions, GrokClient, GrokConversation, GrokConversationListOptions,
     GrokConversationMessage, GrokConversationV2Response, GrokError, GrokFileUploadResponse,
-    GrokMessageOptions, GrokMode, GrokShareLinkOptions, GrokSkill, GrokSpeechToTextOptions,
-    GrokSpeechToTextResponse, GrokStreamParser, GrokTask, GrokTaskCreateOptions,
-    GrokTaskMutationResponse, GrokTaskResult, GrokTaskSchedule, GrokWorkspace,
-    GrokWorkspaceCreateOptions, GrokWorkspaceListOptions, infer_audio_format,
+    GrokMessageOptions, GrokMode, GrokResponseNode, GrokShareLinkOptions, GrokSkill,
+    GrokSpeechToTextOptions, GrokSpeechToTextResponse, GrokStreamParser, GrokTask,
+    GrokTaskCreateOptions, GrokTaskMutationResponse, GrokTaskResult, GrokTaskSchedule,
+    GrokWorkspace, GrokWorkspaceCreateOptions, GrokWorkspaceListOptions, infer_audio_format,
 };
 use interactive::{
     DELETE_CONFIRMATION_PROMPT, is_delete_confirmation, parse_command as parse_interactive_command,
@@ -697,8 +697,19 @@ async fn run_chat_command(
                     .await;
                 }
                 "model" | "models" | "mode" | "modes" => {
-                    if args.is_empty() || (args.len() == 1 && args[0].eq_ignore_ascii_case("list"))
-                    {
+                    if args.is_empty() {
+                        match select_interactive_model(&mut parsed, &mut output, live_output).await
+                        {
+                            Ok(Some(selected_mode)) => {
+                                parsed.selected_mode = selected_mode;
+                                output.push(model_set_message(&parsed.selected_mode));
+                            }
+                            Ok(None) => {}
+                            Err(error) => output.push(format!("Error: {error}")),
+                        }
+                        continue;
+                    }
+                    if args.len() == 1 && args[0].eq_ignore_ascii_case("list") {
                         output.push(interactive_model_list(&parsed.selected_mode));
                         continue;
                     }
@@ -764,11 +775,32 @@ async fn run_chat_command(
                     );
                 }
                 "tasks" => {
-                    push_interactive_command_output(
-                        &mut output,
-                        run_tasks_command(interactive_args_to_strings(&args), top_level_options)
+                    if args.is_empty()
+                        || (args.len() == 1 && args[0].eq_ignore_ascii_case("select"))
+                    {
+                        match handle_interactive_tasks(
+                            &mut conversation_id,
+                            &mut parent_response_id,
+                            parsed.debug,
+                            &mut output,
+                            live_output,
+                            top_level_options,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(error) => output.push(format!("Error: {error}")),
+                        }
+                    } else {
+                        push_interactive_command_output(
+                            &mut output,
+                            run_tasks_command(
+                                interactive_args_to_strings(&args),
+                                top_level_options,
+                            )
                             .await,
-                    );
+                        );
+                    }
                 }
                 "skills" => {
                     push_interactive_command_output(
@@ -1874,6 +1906,496 @@ async fn select_interactive_workspace(
     Ok(())
 }
 
+async fn select_interactive_model(
+    parsed: &mut ParsedChatCommand,
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<Option<GrokMode>> {
+    let modes = load_modes_for_models(parsed.debug).await;
+    if !live_output {
+        output.push(available_models_text(Some(&parsed.selected_mode), &modes));
+        return Ok(None);
+    }
+
+    flush_interactive_output(output, live_output);
+    let items = model_picker_items(&modes);
+    match picker::select_index_from_terminal(
+        "Select model",
+        &items,
+        Some(parsed.selected_mode.id.as_str()),
+    )? {
+        picker::ArrowSelection::Selected(index) => {
+            let Some(mode) = modes.get(index).cloned() else {
+                return Ok(None);
+            };
+            if !mode.is_available {
+                output.push(unavailable_model_message(&mode));
+                return Ok(None);
+            }
+            Ok(Some(mode))
+        }
+        picker::ArrowSelection::Cancelled => Ok(None),
+        picker::ArrowSelection::Unavailable => {
+            output.push(available_models_text(Some(&parsed.selected_mode), &modes));
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedTaskRunChat {
+    run_index: usize,
+    run: GrokTaskResult,
+    conversation_id: String,
+    parent_response_id: String,
+    result_response_id: Option<String>,
+    loaded_responses: Vec<GrokConversationMessage>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveTaskDetailAction {
+    ShowLatest,
+    ShowRuns,
+    OpenLatest,
+    BackToTasks,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveTaskRunViewerMode {
+    Latest,
+    Choose,
+}
+
+#[derive(Clone, Debug)]
+enum InteractiveTaskRunDecision {
+    Open(Box<PreparedTaskRunChat>),
+    Back,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveTaskRunMenuAction {
+    Open,
+    Back,
+}
+
+async fn handle_interactive_tasks(
+    conversation_id: &mut Option<String>,
+    parent_response_id: &mut Option<String>,
+    debug: bool,
+    output: &mut Vec<String>,
+    live_output: bool,
+    top_level_options: &options::GrokCommandOptions,
+) -> Result<()> {
+    if !live_output {
+        push_interactive_command_output(
+            output,
+            run_tasks_command(vec!["select".to_string()], top_level_options).await,
+        );
+        return Ok(());
+    }
+
+    let client = configured_client(debug)?;
+    let tasks = client.list_tasks_response().await?.tasks;
+    run_interactive_task_selection_flow(
+        &client,
+        tasks,
+        conversation_id,
+        parent_response_id,
+        output,
+        live_output,
+    )
+    .await
+}
+
+async fn run_interactive_task_selection_flow(
+    client: &GrokClient,
+    tasks: Vec<GrokTask>,
+    conversation_id: &mut Option<String>,
+    parent_response_id: &mut Option<String>,
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<()> {
+    let mut current_tasks = display_ordered_tasks(tasks);
+    loop {
+        let Some(selected_index) = select_interactive_task(&current_tasks, output, live_output)?
+        else {
+            return Ok(());
+        };
+        let task = current_tasks[selected_index].clone();
+        let should_return_to_tasks = run_interactive_task_detail_flow(
+            client,
+            &task,
+            conversation_id,
+            parent_response_id,
+            output,
+            live_output,
+        )
+        .await?;
+        if !should_return_to_tasks {
+            return Ok(());
+        }
+        current_tasks = display_ordered_tasks(client.list_tasks_response().await?.tasks);
+    }
+}
+
+fn select_interactive_task(
+    tasks: &[GrokTask],
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<Option<usize>> {
+    if tasks.is_empty() {
+        output.push("No tasks found.".to_string());
+        return Ok(None);
+    }
+    if !live_output {
+        output.push(task_rows(tasks));
+        return Ok(None);
+    }
+
+    flush_interactive_output(output, live_output);
+    let items = task_picker_items(tasks);
+    match picker::select_index_from_terminal("Tasks:", &items, None)? {
+        picker::ArrowSelection::Selected(index) => Ok(Some(index)),
+        picker::ArrowSelection::Cancelled => Ok(None),
+        picker::ArrowSelection::Unavailable => {
+            output.push(task_rows(tasks));
+            Ok(None)
+        }
+    }
+}
+
+async fn run_interactive_task_detail_flow(
+    client: &GrokClient,
+    task: &GrokTask,
+    conversation_id: &mut Option<String>,
+    parent_response_id: &mut Option<String>,
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<bool> {
+    output.push(interactive_task_prompt_detail(task));
+    let task_id = task_identifier(task).ok_or_else(|| anyhow::anyhow!("Task is missing taskId"))?;
+
+    loop {
+        let Some(action) = select_interactive_task_detail_action(output, live_output)? else {
+            return Ok(false);
+        };
+        match action {
+            InteractiveTaskDetailAction::BackToTasks => return Ok(true),
+            InteractiveTaskDetailAction::Done => return Ok(false),
+            InteractiveTaskDetailAction::ShowLatest => {
+                let runs = interactive_task_runs(client, &task_id, 1).await?;
+                match run_interactive_task_run_viewer(
+                    client,
+                    &runs,
+                    InteractiveTaskRunViewerMode::Latest,
+                    output,
+                    live_output,
+                )
+                .await?
+                {
+                    Some(InteractiveTaskRunDecision::Open(prepared)) => {
+                        seed_interactive_task_run_chat(
+                            &prepared,
+                            conversation_id,
+                            parent_response_id,
+                            output,
+                        );
+                        return Ok(false);
+                    }
+                    Some(InteractiveTaskRunDecision::Back) | None => {}
+                }
+            }
+            InteractiveTaskDetailAction::ShowRuns => {
+                let runs = interactive_task_runs(client, &task_id, 10).await?;
+                match run_interactive_task_run_viewer(
+                    client,
+                    &runs,
+                    InteractiveTaskRunViewerMode::Choose,
+                    output,
+                    live_output,
+                )
+                .await?
+                {
+                    Some(InteractiveTaskRunDecision::Open(prepared)) => {
+                        seed_interactive_task_run_chat(
+                            &prepared,
+                            conversation_id,
+                            parent_response_id,
+                            output,
+                        );
+                        return Ok(false);
+                    }
+                    Some(InteractiveTaskRunDecision::Back) | None => {}
+                }
+            }
+            InteractiveTaskDetailAction::OpenLatest => {
+                let runs = interactive_task_runs(client, &task_id, 1).await?;
+                let Some((index, run)) = runs.first().cloned() else {
+                    output.push("No task runs found.".to_string());
+                    continue;
+                };
+                let prepared = load_interactive_task_run_chat_context(client, index, run).await?;
+                seed_interactive_task_run_chat(
+                    &prepared,
+                    conversation_id,
+                    parent_response_id,
+                    output,
+                );
+                return Ok(false);
+            }
+        }
+    }
+}
+
+fn select_interactive_task_detail_action(
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<Option<InteractiveTaskDetailAction>> {
+    if !live_output {
+        return Ok(None);
+    }
+    flush_interactive_output(output, live_output);
+    let items = vec![
+        picker::PickerItem::new("latest", "Show latest result"),
+        {
+            let mut item = picker::PickerItem::new("runs", "Show runs");
+            item.subtitle = Some("Page through previous and next runs".to_string());
+            item
+        },
+        {
+            let mut item = picker::PickerItem::new("chat", "Open result chat");
+            item.subtitle = Some("Use latest run".to_string());
+            item
+        },
+        picker::PickerItem::new("back", "Back to tasks"),
+        picker::PickerItem::new("done", "Done"),
+    ];
+    match picker::select_index_from_terminal("Task actions:", &items, None)? {
+        picker::ArrowSelection::Selected(0) => Ok(Some(InteractiveTaskDetailAction::ShowLatest)),
+        picker::ArrowSelection::Selected(1) => Ok(Some(InteractiveTaskDetailAction::ShowRuns)),
+        picker::ArrowSelection::Selected(2) => Ok(Some(InteractiveTaskDetailAction::OpenLatest)),
+        picker::ArrowSelection::Selected(3) => Ok(Some(InteractiveTaskDetailAction::BackToTasks)),
+        picker::ArrowSelection::Selected(_) => Ok(Some(InteractiveTaskDetailAction::Done)),
+        picker::ArrowSelection::Cancelled | picker::ArrowSelection::Unavailable => Ok(None),
+    }
+}
+
+async fn interactive_task_runs(
+    client: &GrokClient,
+    task_id: &str,
+    limit: usize,
+) -> Result<Vec<(usize, GrokTaskResult)>> {
+    Ok(client
+        .task_results_response(task_id, limit)
+        .await?
+        .results
+        .into_iter()
+        .enumerate()
+        .collect())
+}
+
+async fn run_interactive_task_run_viewer(
+    client: &GrokClient,
+    runs: &[(usize, GrokTaskResult)],
+    mode: InteractiveTaskRunViewerMode,
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<Option<InteractiveTaskRunDecision>> {
+    if runs.is_empty() {
+        output.push("No task runs found.".to_string());
+        return Ok(Some(InteractiveTaskRunDecision::Back));
+    }
+
+    match mode {
+        InteractiveTaskRunViewerMode::Latest => {
+            let (index, run) = runs[0].clone();
+            let prepared = load_interactive_task_run_chat_context(client, index, run).await?;
+            output.push(interactive_task_run_result(&prepared));
+            match select_interactive_task_run_action("Back", output, live_output)? {
+                Some(InteractiveTaskRunMenuAction::Open) => {
+                    Ok(Some(InteractiveTaskRunDecision::Open(Box::new(prepared))))
+                }
+                Some(InteractiveTaskRunMenuAction::Back) | None => {
+                    Ok(Some(InteractiveTaskRunDecision::Back))
+                }
+            }
+        }
+        InteractiveTaskRunViewerMode::Choose => loop {
+            let Some(selected_index) = select_interactive_task_run(runs, output, live_output)?
+            else {
+                return Ok(Some(InteractiveTaskRunDecision::Back));
+            };
+            let (index, run) = runs[selected_index].clone();
+            let prepared = load_interactive_task_run_chat_context(client, index, run).await?;
+            output.push(interactive_task_run_result(&prepared));
+            match select_interactive_task_run_action("Back to runs", output, live_output)? {
+                Some(InteractiveTaskRunMenuAction::Open) => {
+                    return Ok(Some(InteractiveTaskRunDecision::Open(Box::new(prepared))));
+                }
+                Some(InteractiveTaskRunMenuAction::Back) | None => {}
+            }
+        },
+    }
+}
+
+fn select_interactive_task_run(
+    runs: &[(usize, GrokTaskResult)],
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<Option<usize>> {
+    if !live_output {
+        return Ok(None);
+    }
+    flush_interactive_output(output, live_output);
+    let items = task_run_picker_items(runs);
+    match picker::select_index_from_terminal("Task runs:", &items, None)? {
+        picker::ArrowSelection::Selected(index) => Ok(Some(index)),
+        picker::ArrowSelection::Cancelled | picker::ArrowSelection::Unavailable => Ok(None),
+    }
+}
+
+fn select_interactive_task_run_action(
+    back_title: &str,
+    output: &mut Vec<String>,
+    live_output: bool,
+) -> Result<Option<InteractiveTaskRunMenuAction>> {
+    if !live_output {
+        return Ok(None);
+    }
+    flush_interactive_output(output, live_output);
+    let items = vec![
+        picker::PickerItem::new("open", "Open chat"),
+        picker::PickerItem::new("back", back_title),
+    ];
+    match picker::select_index_from_terminal("Task run actions:", &items, None)? {
+        picker::ArrowSelection::Selected(0) => Ok(Some(InteractiveTaskRunMenuAction::Open)),
+        picker::ArrowSelection::Selected(_) => Ok(Some(InteractiveTaskRunMenuAction::Back)),
+        picker::ArrowSelection::Cancelled | picker::ArrowSelection::Unavailable => Ok(None),
+    }
+}
+
+async fn load_interactive_task_run_chat_context(
+    client: &GrokClient,
+    index: usize,
+    run: GrokTaskResult,
+) -> Result<PreparedTaskRunChat> {
+    let conversation_id = task_result_conversation_id(&run)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Task run is missing conversationId"))?;
+
+    let _ = client
+        .get_conversation_v2(&conversation_id, true, true)
+        .await?;
+    let nodes = client
+        .get_response_nodes(&conversation_id, true)
+        .await
+        .unwrap_or_default();
+    let (inferred_parent_response_id, inferred_result_response_id, secondary_response_id) =
+        inferred_task_run_response_pair(&nodes);
+
+    let result_response_id = task_result_response_id(&run)
+        .or(inferred_result_response_id)
+        .and_then(non_empty_string);
+    let parent_response_id = result_response_id
+        .clone()
+        .or_else(|| selected_run_parent_response_id(&run))
+        .or(inferred_parent_response_id)
+        .and_then(non_empty_string);
+    let response_ids = unique_response_ids([
+        result_response_id.clone(),
+        secondary_response_id,
+        parent_response_id.clone(),
+    ]);
+    let loaded_responses = if response_ids.is_empty() {
+        Vec::new()
+    } else {
+        client
+            .load_responses(&conversation_id, Some(&response_ids))
+            .await?
+    };
+
+    let resolved_parent_response_id = parent_response_id
+        .or_else(|| {
+            result_response_id.as_ref().and_then(|result_response_id| {
+                loaded_responses
+                    .iter()
+                    .find(|response| response.response_id == *result_response_id)
+                    .and_then(|response| response.parent_response_id.clone())
+            })
+        })
+        .or_else(|| result_response_id.clone())
+        .and_then(non_empty_string)
+        .ok_or_else(|| anyhow::anyhow!("Task run is missing responseId"))?;
+
+    Ok(PreparedTaskRunChat {
+        run_index: index,
+        run,
+        conversation_id,
+        parent_response_id: resolved_parent_response_id,
+        result_response_id,
+        loaded_responses,
+    })
+}
+
+fn seed_interactive_task_run_chat(
+    prepared: &PreparedTaskRunChat,
+    conversation_id: &mut Option<String>,
+    parent_response_id: &mut Option<String>,
+    output: &mut Vec<String>,
+) {
+    *conversation_id = Some(prepared.conversation_id.clone());
+    *parent_response_id = Some(prepared.parent_response_id.clone());
+    output.push(interactive_task_run_loaded(prepared));
+}
+
+fn inferred_task_run_response_pair(
+    nodes: &[GrokResponseNode],
+) -> (Option<String>, Option<String>, Option<String>) {
+    if nodes.is_empty() {
+        return (None, None, None);
+    }
+    let result_response_id = nodes
+        .iter()
+        .find(|node| {
+            matches!(
+                node.sender.trim().to_lowercase().as_str(),
+                "assistant" | "grok" | "model"
+            )
+        })
+        .or_else(|| nodes.last())
+        .map(|node| node.response_id.clone());
+    let secondary_response_id = nodes
+        .iter()
+        .find(|node| Some(node.response_id.as_str()) != result_response_id.as_deref())
+        .map(|node| node.response_id.clone());
+    (
+        result_response_id.clone(),
+        result_response_id,
+        secondary_response_id,
+    )
+}
+
+fn unique_response_ids<const N: usize>(ids: [Option<String>; N]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut values = Vec::new();
+    for id in ids {
+        let Some(id) = id.and_then(non_empty_string) else {
+            continue;
+        };
+        if seen.insert(id.clone()) {
+            values.push(id);
+        }
+    }
+    values
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn interactive_workspace_selection_rows(workspaces: &[GrokWorkspace]) -> String {
     let mut lines = vec!["Select workspace:".to_string(), "0. None".to_string()];
     for (index, workspace) in workspaces.iter().enumerate() {
@@ -1962,6 +2484,251 @@ fn workspace_picker_items(workspaces: &[GrokWorkspace]) -> Vec<picker::PickerIte
         item
     }));
     items
+}
+
+fn model_picker_items(modes: &[GrokMode]) -> Vec<picker::PickerItem> {
+    modes
+        .iter()
+        .map(|mode| {
+            let mut item = picker::PickerItem::new(&mode.id, &mode.display_name);
+            item.subtitle = Some(mode.id.clone());
+            item.preview = if mode.summary.is_empty() {
+                mode.unavailable_description()
+            } else {
+                Some(mode.summary.clone())
+            };
+            item.is_enabled = mode.is_available;
+            item.search_text = format!("{} {} {}", mode.display_name, mode.id, mode.summary);
+            item
+        })
+        .collect()
+}
+
+fn unavailable_model_message(mode: &GrokMode) -> String {
+    format!(
+        "Model unavailable: {} ({}) - {}",
+        mode.display_name,
+        mode.id,
+        mode.unavailable_description()
+            .unwrap_or_else(|| "not available for this account".to_string())
+    )
+}
+
+fn task_picker_items(tasks: &[GrokTask]) -> Vec<picker::PickerItem> {
+    tasks
+        .iter()
+        .map(|task| {
+            let id = task_identifier(task).unwrap_or_else(|| "unknown".to_string());
+            let title = task_title(task).unwrap_or_else(|| id.clone());
+            let subtitle = [task_status(task), schedule_value(&task.raw_json)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let preview = latest_task_result_summary(task);
+            let mut item = picker::PickerItem::new(&id, title);
+            if !subtitle.is_empty() {
+                item.subtitle = Some(subtitle);
+            }
+            item.preview = preview.clone();
+            item.search_text = [
+                Some(id.as_str()),
+                item.title.as_str().into(),
+                task.prompt.as_deref(),
+                preview.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+            item
+        })
+        .collect()
+}
+
+fn task_run_picker_items(runs: &[(usize, GrokTaskResult)]) -> Vec<picker::PickerItem> {
+    runs.iter()
+        .map(|(index, run)| {
+            let id = run
+                .resolved_id()
+                .map(ToOwned::to_owned)
+                .or_else(|| task_result_response_id(run))
+                .unwrap_or_else(|| index.to_string());
+            let title = task_run_title(*index, run);
+            let mut item = picker::PickerItem::new(&id, title);
+            item.subtitle = run.status.as_deref().and_then(compact_task_status);
+            item.metadata_label = Some("run".to_string());
+            item.metadata = Some(task_run_metadata(*index, run));
+            item.preview_label = "result".to_string();
+            item.preview = task_result_message(run);
+            item.rebuild_search_text();
+            item
+        })
+        .collect()
+}
+
+fn interactive_task_prompt_detail(task: &GrokTask) -> String {
+    let heading = task_summary(task);
+    let mut lines = vec![if heading.is_empty() {
+        "Task".to_string()
+    } else {
+        heading
+    }];
+    if let Some(prompt) = task_prompt(task) {
+        lines.push(String::new());
+        lines.push(prompt);
+    }
+    lines.join("\n")
+}
+
+fn interactive_task_run_result(prepared: &PreparedTaskRunChat) -> String {
+    let mut lines = vec![
+        "Task run".to_string(),
+        [
+            Some(task_run_title(prepared.run_index, &prepared.run)),
+            prepared.run.status.as_deref().and_then(compact_task_status),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("  "),
+    ];
+    match task_run_loaded_response_text(prepared) {
+        Some(body) => {
+            lines.push(String::new());
+            lines.push(body);
+            lines.push(String::new());
+        }
+        None => {
+            lines.push(String::new());
+            lines.push("No loaded response body was available for this run.".to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+fn interactive_task_run_loaded(prepared: &PreparedTaskRunChat) -> String {
+    let mut lines = vec!["Opened task run chat".to_string()];
+    lines.push(task_run_metadata(prepared.run_index, &prepared.run));
+    let run_response_id = task_result_response_id(&prepared.run);
+    if run_response_id.is_none()
+        && let Some(result_response_id) = prepared.result_response_id.as_deref()
+    {
+        lines.push(format!("responseId: {result_response_id}"));
+    }
+    lines.push(format!("parentResponseId: {}", prepared.parent_response_id));
+    lines.push("The next chat message will continue this task run thread.".to_string());
+    lines.join("\n")
+}
+
+fn task_run_title(index: usize, result: &GrokTaskResult) -> String {
+    [
+        Some(run_ordinal_label(index)),
+        task_result_timestamp(result).map(|timestamp| task_run_timestamp_label(&timestamp)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("  ")
+}
+
+fn task_run_metadata(index: usize, result: &GrokTaskResult) -> String {
+    [
+        Some(format!("run: {}", task_run_title(index, result))),
+        result
+            .resolved_id()
+            .map(|result_id| format!("resultId: {result_id}")),
+        task_result_conversation_id(result)
+            .as_deref()
+            .map(|conversation_id| format!("conversationId: {conversation_id}")),
+        task_result_response_id(result)
+            .as_deref()
+            .map(|response_id| format!("responseId: {response_id}")),
+        result
+            .status
+            .as_deref()
+            .and_then(compact_task_status)
+            .map(|status| format!("status: {status}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn task_run_loaded_response_text(prepared: &PreparedTaskRunChat) -> Option<String> {
+    let preferred_response_id = prepared
+        .result_response_id
+        .clone()
+        .or_else(|| task_result_response_id(&prepared.run));
+    let preferred = preferred_response_id.as_deref();
+    let loaded = preferred
+        .and_then(|response_id| {
+            prepared
+                .loaded_responses
+                .iter()
+                .find(|response| response.response_id == response_id)
+        })
+        .or_else(|| {
+            if preferred.is_none() {
+                prepared.loaded_responses.last()
+            } else {
+                None
+            }
+        });
+    if let Some(message) = loaded
+        .map(|response| response.message.trim())
+        .filter(|message| !message.is_empty())
+    {
+        return Some(GrokStreamMarkupParser::visible_text(message, true));
+    }
+    task_result_message(&prepared.run)
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+}
+
+fn latest_task_result_summary(task: &GrokTask) -> Option<String> {
+    latest_task_result_value(&task.raw_json)
+        .map(|value| task_result_display_text(&value))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn task_result_display_text(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    if let Some(text) = string_in_value(
+        value,
+        &["summary", "message", "text", "content", "output", "result"],
+    ) {
+        return text;
+    }
+    let summary = [
+        string_in_value(value, &["status", "state"])
+            .as_deref()
+            .and_then(compact_task_status),
+        string_in_value(
+            value,
+            &[
+                "createTime",
+                "createdAt",
+                "created_at",
+                "completedAt",
+                "completed_at",
+                "lastRunAt",
+                "last_run_at",
+            ],
+        )
+        .map(compact_timestamp),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("  ");
+    if !summary.is_empty() {
+        return summary;
+    }
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn asset_picker_items(assets: &[GrokAsset]) -> Vec<picker::PickerItem> {
@@ -9202,5 +9969,59 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn task_picker_items_match_swift_task_preview_shape() {
+        let task = GrokTask {
+            task_id: Some("task-1".to_string()),
+            id: None,
+            name: Some("Daily report".to_string()),
+            prompt: Some("Summarize the day".to_string()),
+            is_enabled: Some(true),
+            status: Some("TASK_ENABLED".to_string()),
+            raw_json: json!({
+                "taskId": "task-1",
+                "scheduledAt": "daily",
+                "latestResult": {
+                    "status": "TASK_RESULT_SUCCESS",
+                    "message": "Done"
+                }
+            }),
+        };
+
+        let items = task_picker_items(&[task]);
+
+        assert_eq!(items[0].id, "task-1");
+        assert_eq!(items[0].title, "Daily report");
+        assert_eq!(items[0].subtitle.as_deref(), Some("enabled | daily"));
+        assert_eq!(items[0].preview.as_deref(), Some("Done"));
+        assert!(items[0].search_text.contains("Summarize the day"));
+    }
+
+    #[test]
+    fn inferred_task_run_response_pair_prefers_assistant_response_like_swift() {
+        let nodes = vec![
+            GrokResponseNode {
+                response_id: "user-1".to_string(),
+                sender: "user".to_string(),
+                parent_response_id: None,
+            },
+            GrokResponseNode {
+                response_id: "assistant-1".to_string(),
+                sender: "assistant".to_string(),
+                parent_response_id: Some("user-1".to_string()),
+            },
+        ];
+
+        assert_eq!(
+            inferred_task_run_response_pair(&nodes),
+            (
+                Some("assistant-1".to_string()),
+                Some("assistant-1".to_string()),
+                Some("user-1".to_string())
+            )
+        );
+        assert_eq!(inferred_task_run_response_pair(&[]), (None, None, None));
     }
 }

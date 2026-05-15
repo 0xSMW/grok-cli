@@ -150,7 +150,7 @@ pub fn select_index_from_terminal(
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 clear_picker(&mut stdout, previous_rows)?;
-                writeln!(stdout)?;
+                write_raw_newline(&mut stdout)?;
                 stdout.flush()?;
                 return Ok(ArrowSelection::Cancelled);
             }
@@ -170,7 +170,7 @@ pub fn select_index_from_terminal(
                     continue;
                 };
                 clear_picker(&mut stdout, previous_rows)?;
-                writeln!(stdout, "{}", selected_item.title)?;
+                write_raw_line(&mut stdout, &selected_item.title)?;
                 stdout.flush()?;
                 return Ok(ArrowSelection::Selected(original_index));
             }
@@ -257,11 +257,19 @@ fn render_picker(
         if index + 1 == rendered.len() {
             write!(stdout, "{line}")?;
         } else {
-            writeln!(stdout, "{line}")?;
+            write_raw_line(stdout, line)?;
         }
     }
     stdout.flush()?;
     Ok(terminal_row_count(&rendered, width))
+}
+
+fn write_raw_line(stdout: &mut std::io::Stdout, line: &str) -> std::io::Result<()> {
+    write!(stdout, "{line}\r\n")
+}
+
+fn write_raw_newline(stdout: &mut std::io::Stdout) -> std::io::Result<()> {
+    write!(stdout, "\r\n")
 }
 
 fn clear_picker(stdout: &mut std::io::Stdout, previous_rows: usize) -> std::io::Result<()> {

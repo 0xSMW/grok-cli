@@ -457,7 +457,7 @@ where
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 clear_input_editor(&mut stdout, previous_render)?;
-                writeln!(stdout)?;
+                write_raw_newline(&mut stdout)?;
                 stdout.flush()?;
                 return Ok(TerminalInputResult::Cancelled);
             }
@@ -465,7 +465,7 @@ where
                 if key.modifiers.contains(KeyModifiers::CONTROL) && buffer.display_count() == 0 =>
             {
                 clear_input_editor(&mut stdout, previous_render)?;
-                writeln!(stdout)?;
+                write_raw_newline(&mut stdout)?;
                 stdout.flush()?;
                 return Ok(TerminalInputResult::Cancelled);
             }
@@ -596,11 +596,9 @@ where
         }
     }
     clear_input_editor(context.stdout, context.previous_render)?;
-    writeln!(
+    write_raw_line(
         context.stdout,
-        "{}{}",
-        context.prompt,
-        context.buffer.display()
+        &format!("{}{}", context.prompt, context.buffer.display()),
     )?;
     context.stdout.flush()?;
     Ok(Some(TerminalInputResult::Submitted(
@@ -659,7 +657,7 @@ fn render_input_editor(
 
     let suggestion_lines = suggestion_lines(suggestions, selected_suggestion_index, width);
     for line in &suggestion_lines {
-        writeln!(stdout, "{line}")?;
+        write_raw_line(stdout, line)?;
     }
 
     let ghost = ghost_suffix(&display, suggestions, selected_suggestion_index);
@@ -696,7 +694,7 @@ fn render_slash_command_editor(
     let suggestion_lines =
         slash_command_suggestion_lines(suggestions, selected_suggestion_index, width);
     for line in &suggestion_lines {
-        writeln!(stdout)?;
+        write_raw_newline(stdout)?;
         write!(stdout, "{line}")?;
     }
 
@@ -759,6 +757,14 @@ fn clear_input_editor(
         )?;
     }
     stdout.flush()
+}
+
+fn write_raw_line(stdout: &mut std::io::Stdout, line: &str) -> std::io::Result<()> {
+    write!(stdout, "{line}\r\n")
+}
+
+fn write_raw_newline(stdout: &mut std::io::Stdout) -> std::io::Result<()> {
+    write!(stdout, "\r\n")
 }
 
 fn suggestion_lines(
