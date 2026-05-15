@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use stream_display::{GrokStreamMarkupParser, StreamDisplayEvent};
 use task_format::{compact_task_status, schedule_enabled, schedule_value, task_status};
-use typeahead::InputTypeaheadSuggestion;
+use typeahead::{InputTypeaheadSuggestion, RemoteTypeaheadController};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -506,7 +506,9 @@ async fn run_chat_command(
         if live_output {
             output.extend(interactive_status_lines(&parsed));
         }
-        let Some(line) = read_interactive_line(&mut lines, &mut output, live_output, "> ")? else {
+        let Some(line) =
+            read_interactive_prompt_line(&mut lines, &mut output, live_output, "> ", &parsed)?
+        else {
             break;
         };
         let trimmed = line.trim();
@@ -1357,12 +1359,108 @@ fn read_interactive_line(
     live_output: bool,
     prompt: &str,
 ) -> Result<Option<String>> {
+    read_interactive_line_with_prefill(lines, output, live_output, prompt, "")
+}
+
+fn read_interactive_line_with_prefill(
+    lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
+    output: &mut Vec<String>,
+    live_output: bool,
+    prompt: &str,
+    prefill: &str,
+) -> Result<Option<String>> {
     flush_interactive_output(output, live_output);
+    if live_output {
+        match input::read_terminal_line(prompt, prefill, |_| Vec::new())? {
+            input::TerminalInputResult::Submitted(line) => return Ok(Some(line)),
+            input::TerminalInputResult::Cancelled => return Ok(None),
+            input::TerminalInputResult::Unavailable => {}
+        }
+    }
+    if live_output && !prompt.is_empty() {
+        print!("{prompt}");
+        let _ = std::io::stdout().flush();
+        if !prefill.is_empty() {
+            print!("{prefill}");
+            let _ = std::io::stdout().flush();
+        }
+    }
+    Ok(lines.next().transpose()?)
+}
+
+fn read_interactive_prompt_line(
+    lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
+    output: &mut Vec<String>,
+    live_output: bool,
+    prompt: &str,
+    parsed: &ParsedChatCommand,
+) -> Result<Option<String>> {
+    flush_interactive_output(output, live_output);
+    if live_output {
+        let mut remote_cache: std::collections::HashMap<String, Vec<InputTypeaheadSuggestion>> =
+            std::collections::HashMap::new();
+        let result = input::read_terminal_line(prompt, "", |buffer| {
+            let remote_suggestions = if parsed.typeahead_enabled {
+                let query = remote_typeahead_query(buffer);
+                query
+                    .and_then(|query| {
+                        if !remote_cache.contains_key(&query) {
+                            let suggestions =
+                                fetch_remote_typeahead_suggestions(&query, parsed.debug);
+                            remote_cache.insert(query.clone(), suggestions);
+                        }
+                        remote_cache.get(&query).cloned()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            interactive_completion_suggestions(buffer, &remote_suggestions)
+        })?;
+        match result {
+            input::TerminalInputResult::Submitted(line) => return Ok(Some(line)),
+            input::TerminalInputResult::Cancelled => return Ok(None),
+            input::TerminalInputResult::Unavailable => {}
+        }
+    }
     if live_output && !prompt.is_empty() {
         print!("{prompt}");
         let _ = std::io::stdout().flush();
     }
     Ok(lines.next().transpose()?)
+}
+
+fn remote_typeahead_query(buffer: &str) -> Option<String> {
+    let trimmed = buffer.trim();
+    if trimmed.chars().count() < 2
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("[Pasted content ")
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn fetch_remote_typeahead_suggestions(query: &str, debug: bool) -> Vec<InputTypeaheadSuggestion> {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Vec::new();
+    };
+    let query = query.to_string();
+    let result = tokio::task::block_in_place(|| {
+        handle.block_on(async move {
+            let client = configured_client(debug)?;
+            let response = client
+                .typeahead_response(&query, "en-US", 3, "web", 2)
+                .await?;
+            Ok::<_, anyhow::Error>(RemoteTypeaheadController::normalize_remote_suggestions(
+                response.suggestions,
+                3,
+            ))
+        })
+    });
+    result.unwrap_or_default()
 }
 
 fn clear_interactive_screen(live_output: bool) {
@@ -1647,27 +1745,38 @@ async fn select_interactive_conversation(
         return Ok(());
     }
 
-    output.push(conversation_rows(&conversations));
-    let Some(selection) = read_interactive_line(
-        lines,
-        output,
-        live_output,
-        "Select a conversation by number: ",
-    )?
-    else {
-        return Ok(());
+    let selected_index = if live_output {
+        flush_interactive_output(output, live_output);
+        let items = conversation_picker_items(&conversations);
+        match picker::select_index_from_terminal("Select conversation", &items, None)? {
+            picker::ArrowSelection::Selected(index) => Some(index),
+            picker::ArrowSelection::Cancelled => None,
+            picker::ArrowSelection::Unavailable => select_interactive_numbered_index(
+                lines,
+                output,
+                live_output,
+                conversation_rows(&conversations),
+                "Select a conversation by number: ",
+                conversations.len(),
+                false,
+            )?,
+        }
+    } else {
+        select_interactive_numbered_index(
+            lines,
+            output,
+            live_output,
+            conversation_rows(&conversations),
+            "Select a conversation by number: ",
+            conversations.len(),
+            false,
+        )?
     };
-    let selection = selection.trim();
-    let Ok(number) = selection.parse::<usize>() else {
-        output.push("Invalid selection.".to_string());
-        return Ok(());
-    };
-    if number == 0 || number > conversations.len() {
-        output.push("Invalid selection.".to_string());
-        return Ok(());
-    }
 
-    let selected = &conversations[number - 1];
+    let Some(selected_index) = selected_index else {
+        return Ok(());
+    };
+    let selected = &conversations[selected_index];
     output.push(format!("Loading conversation \"{}\"...", selected.title));
     let responses = client
         .load_responses(&selected.conversation_id, None)
@@ -1708,33 +1817,52 @@ async fn select_interactive_workspace(
     if let Some(label) = parsed.workspace_label.as_deref() {
         output.push(format!("Current workspace: {label}"));
     }
-    output.push(interactive_workspace_selection_rows(&workspaces));
+    let selected_index = if live_output {
+        flush_interactive_output(output, live_output);
+        let items = workspace_picker_items(&workspaces);
+        match picker::select_index_from_terminal(
+            "Select workspace",
+            &items,
+            parsed.workspace_ids.first().map(String::as_str),
+        )? {
+            picker::ArrowSelection::Selected(index) => Some(index),
+            picker::ArrowSelection::Cancelled => None,
+            picker::ArrowSelection::Unavailable => select_interactive_numbered_index(
+                lines,
+                output,
+                live_output,
+                interactive_workspace_selection_rows(&workspaces),
+                "Select workspace by number: ",
+                workspaces.len(),
+                true,
+            )?,
+        }
+    } else {
+        select_interactive_numbered_index(
+            lines,
+            output,
+            live_output,
+            interactive_workspace_selection_rows(&workspaces),
+            "Select workspace by number: ",
+            workspaces.len(),
+            true,
+        )?
+    };
 
-    let Some(selection) =
-        read_interactive_line(lines, output, live_output, "Select workspace by number: ")?
-    else {
+    let Some(selected_index) = selected_index else {
         return Ok(());
     };
-    let selection = selection.trim();
-    let Ok(number) = selection.parse::<usize>() else {
-        output.push("Invalid selection.".to_string());
-        return Ok(());
-    };
-    if number > workspaces.len() {
-        output.push("Invalid selection.".to_string());
-        return Ok(());
-    }
 
     conversation_id.take();
     parent_response_id.take();
-    if number == 0 {
+    if selected_index == 0 {
         parsed.workspace_ids.clear();
         parsed.workspace_label = None;
         output.push("Workspace cleared. New chats will not be project-scoped.".to_string());
         return Ok(());
     }
 
-    let workspace = &workspaces[number - 1];
+    let workspace = &workspaces[selected_index - 1];
     let Some(workspace_id) = workspace.resolved_id().map(ToOwned::to_owned) else {
         output.push("Selected workspace has no usable ID.".to_string());
         return Ok(());
@@ -1754,6 +1882,106 @@ fn interactive_workspace_selection_rows(workspaces: &[GrokWorkspace]) -> String 
         lines.push(format!("{}. {label} {id}", index + 1));
     }
     lines.join("\n")
+}
+
+fn select_interactive_numbered_index(
+    lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
+    output: &mut Vec<String>,
+    live_output: bool,
+    rows: String,
+    prompt: &str,
+    item_count: usize,
+    allows_zero: bool,
+) -> Result<Option<usize>> {
+    output.push(rows);
+    let Some(selection) = read_interactive_line(lines, output, live_output, prompt)? else {
+        return Ok(None);
+    };
+    let selection = selection.trim();
+    let Ok(number) = selection.parse::<usize>() else {
+        output.push("Invalid selection.".to_string());
+        return Ok(None);
+    };
+
+    if allows_zero && number == 0 {
+        return Ok(Some(0));
+    }
+    if number == 0 || number > item_count {
+        output.push("Invalid selection.".to_string());
+        return Ok(None);
+    }
+    Ok(Some(if allows_zero { number } else { number - 1 }))
+}
+
+fn conversation_picker_items(conversations: &[GrokConversation]) -> Vec<picker::PickerItem> {
+    conversations
+        .iter()
+        .map(|conversation| {
+            let subtitle = if conversation.modify_time.is_empty() {
+                conversation.conversation_id.clone()
+            } else {
+                format!("modified {}", conversation.modify_time)
+            };
+            let mut item =
+                picker::PickerItem::new(&conversation.conversation_id, &conversation.title);
+            item.subtitle = Some(subtitle);
+            if !conversation.modify_time.is_empty() {
+                item.metadata_label = Some("modified".to_string());
+                item.metadata = Some(conversation.modify_time.clone());
+            }
+            if !conversation.preview.is_empty() {
+                item.preview = Some(conversation.preview.clone());
+            }
+            item.rebuild_search_text();
+            item
+        })
+        .collect()
+}
+
+fn workspace_picker_items(workspaces: &[GrokWorkspace]) -> Vec<picker::PickerItem> {
+    let mut items = vec![picker::PickerItem {
+        subtitle: Some("New chats will not be project-scoped".to_string()),
+        preview_label: "scope".to_string(),
+        preview: Some("Clear the current workspace selection.".to_string()),
+        ..picker::PickerItem::new("__none__", "None")
+    }];
+
+    items.extend(workspaces.iter().enumerate().map(|(index, workspace)| {
+        let id = workspace
+            .resolved_id()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("workspace-{index}"));
+        let mut item = picker::PickerItem::new(id, workspace_display_name(workspace));
+        item.subtitle = workspace.resolved_id().map(ToOwned::to_owned);
+        item.metadata_label = Some("model".to_string());
+        item.metadata = workspace.preferred_model.clone();
+        item.preview_label = "personality".to_string();
+        item.preview = workspace.custom_personality.clone();
+        item.is_enabled = workspace.resolved_id().is_some();
+        item.rebuild_search_text();
+        item
+    }));
+    items
+}
+
+fn asset_picker_items(assets: &[GrokAsset]) -> Vec<picker::PickerItem> {
+    assets
+        .iter()
+        .enumerate()
+        .map(|(index, asset)| {
+            let id = asset
+                .resolved_id()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("asset-{index}"));
+            let mut item = picker::PickerItem::new(id, asset_display_name(asset));
+            item.subtitle = asset.resolved_id().map(ToOwned::to_owned);
+            item.metadata_label = Some("mime".to_string());
+            item.metadata = asset.mime_type.clone();
+            item.is_enabled = asset.resolved_id().is_some();
+            item.rebuild_search_text();
+            item
+        })
+        .collect()
 }
 
 async fn handle_interactive_attach(
@@ -1854,23 +2082,38 @@ async fn select_interactive_attachment(
         return Ok(AttachCommand::Noop);
     }
 
-    output.push(interactive_attachment_selection_rows(&assets));
-    let Some(selection) =
-        read_interactive_line(lines, output, live_output, "Select file by number: ")?
-    else {
-        return Ok(AttachCommand::Noop);
+    let selected_index = if live_output {
+        flush_interactive_output(output, live_output);
+        let items = asset_picker_items(&assets);
+        match picker::select_index_from_terminal("Select file", &items, None)? {
+            picker::ArrowSelection::Selected(index) => Some(index),
+            picker::ArrowSelection::Cancelled => None,
+            picker::ArrowSelection::Unavailable => select_interactive_numbered_index(
+                lines,
+                output,
+                live_output,
+                interactive_attachment_selection_rows(&assets),
+                "Select file by number: ",
+                assets.len(),
+                false,
+            )?,
+        }
+    } else {
+        select_interactive_numbered_index(
+            lines,
+            output,
+            live_output,
+            interactive_attachment_selection_rows(&assets),
+            "Select file by number: ",
+            assets.len(),
+            false,
+        )?
     };
-    let selection = selection.trim();
-    let Ok(number) = selection.parse::<usize>() else {
-        output.push("Invalid selection.".to_string());
-        return Ok(AttachCommand::Noop);
-    };
-    if number == 0 || number > assets.len() {
-        output.push("Invalid selection.".to_string());
-        return Ok(AttachCommand::Noop);
-    }
 
-    let asset = &assets[number - 1];
+    let Some(selected_index) = selected_index else {
+        return Ok(AttachCommand::Noop);
+    };
+    let asset = &assets[selected_index];
     let Some(file_id) = asset.resolved_id().map(ToOwned::to_owned) else {
         output.push("Selected file has no usable attachment ID.".to_string());
         return Ok(AttachCommand::Noop);
@@ -1943,7 +2186,14 @@ async fn handle_interactive_audio(
             output.push("Edit transcript, then press Enter to send.".to_string());
         }
         if is_interactive_terminal() {
-            let Some(edited) = read_interactive_line(lines, output, live_output, "> ")? else {
+            let Some(edited) = read_interactive_line_with_prefill(
+                lines,
+                output,
+                live_output,
+                "> ",
+                &response.text,
+            )?
+            else {
                 return Ok(());
             };
             let edited = edited.trim();

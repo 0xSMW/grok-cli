@@ -23,6 +23,7 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+crossterm = { workspace = true }
 dirs = { workspace = true }
 grok-client = { path = "../grok-client" }
 reqwest = { workspace = true }

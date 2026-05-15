@@ -1,4 +1,16 @@
 use crate::InteractiveCompletionSuggestion;
+use crate::terminal::{truncate_end, visible_length};
+use anyhow::Result;
+use crossterm::{
+    cursor,
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
+    execute, queue,
+    terminal::{self, ClearType},
+};
+use std::io::{IsTerminal, Write};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InputSegment {
@@ -385,6 +397,378 @@ impl InputCompletionState {
 pub struct InputCompletionAcceptance {
     pub cursor_index: usize,
     pub should_submit: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum TerminalInputResult {
+    Submitted(String),
+    Cancelled,
+    Unavailable,
+}
+
+pub fn read_terminal_line<F>(
+    prompt: &str,
+    prefill: &str,
+    mut completion_provider: F,
+) -> Result<TerminalInputResult>
+where
+    F: FnMut(&str) -> Vec<InteractiveCompletionSuggestion>,
+{
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(TerminalInputResult::Unavailable);
+    }
+
+    let mut stdout = std::io::stdout();
+    let _guard = match RawTerminalGuard::activate(&mut stdout) {
+        Ok(guard) => guard,
+        Err(_) => return Ok(TerminalInputResult::Unavailable),
+    };
+
+    let mut buffer = InputLineBuffer::new(prefill);
+    let mut cursor_index = buffer.display_count();
+    let mut completion_state = InputCompletionState::default();
+    let mut suggestions = completion_provider(&buffer.display());
+    let mut previous_rows = 0;
+
+    loop {
+        previous_rows = render_input_editor(
+            &mut stdout,
+            previous_rows,
+            prompt,
+            &buffer,
+            cursor_index,
+            &suggestions,
+            completion_state.selected_suggestion_index(),
+        )?;
+
+        let event = event::read()?;
+        let Event::Key(key) = event else {
+            if let Event::Paste(content) = event {
+                cursor_index = buffer.insert_pasted_content(&content, cursor_index);
+                completion_state.clear_selection();
+                suggestions = completion_provider(&buffer.display());
+            }
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                clear_input_editor(&mut stdout, previous_rows)?;
+                writeln!(stdout)?;
+                stdout.flush()?;
+                return Ok(TerminalInputResult::Cancelled);
+            }
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && buffer.display_count() == 0 =>
+            {
+                clear_input_editor(&mut stdout, previous_rows)?;
+                writeln!(stdout)?;
+                stdout.flush()?;
+                return Ok(TerminalInputResult::Cancelled);
+            }
+            KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(result) = submit_input_line(
+                    SubmitInputContext {
+                        stdout: &mut stdout,
+                        previous_rows,
+                        prompt,
+                        buffer: &mut buffer,
+                        cursor_index: &mut cursor_index,
+                        completion_state: &mut completion_state,
+                        suggestions: &mut suggestions,
+                    },
+                    &mut completion_provider,
+                )? {
+                    return Ok(result);
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                buffer.clear();
+                cursor_index = 0;
+                completion_state.clear_selection();
+                suggestions = completion_provider(&buffer.display());
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                cursor_index = 0;
+                completion_state.clear_selection();
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                cursor_index = buffer.display_count();
+                completion_state.clear_selection();
+            }
+            KeyCode::Enter => {
+                if let Some(result) = submit_input_line(
+                    SubmitInputContext {
+                        stdout: &mut stdout,
+                        previous_rows,
+                        prompt,
+                        buffer: &mut buffer,
+                        cursor_index: &mut cursor_index,
+                        completion_state: &mut completion_state,
+                        suggestions: &mut suggestions,
+                    },
+                    &mut completion_provider,
+                )? {
+                    return Ok(result);
+                }
+            }
+            KeyCode::Tab => {
+                cursor_index = completion_state.apply_completion(&mut buffer, &suggestions);
+                suggestions = completion_provider(&buffer.display());
+            }
+            KeyCode::BackTab if completion_state.move_suggestion_selection(-1, &suggestions) => {
+                continue;
+            }
+            KeyCode::Up => {
+                let _ = completion_state.move_suggestion_selection(-1, &suggestions);
+            }
+            KeyCode::Down => {
+                let _ = completion_state.move_suggestion_selection(1, &suggestions);
+            }
+            KeyCode::Left => {
+                cursor_index = cursor_index.saturating_sub(1);
+                completion_state.clear_selection();
+            }
+            KeyCode::Right => {
+                cursor_index = (cursor_index + 1).min(buffer.display_count());
+                completion_state.clear_selection();
+            }
+            KeyCode::Home => {
+                cursor_index = 0;
+                completion_state.clear_selection();
+            }
+            KeyCode::End => {
+                cursor_index = buffer.display_count();
+                completion_state.clear_selection();
+            }
+            KeyCode::Backspace => {
+                cursor_index = buffer.backspace(cursor_index);
+                completion_state.clear_selection();
+                suggestions = completion_provider(&buffer.display());
+            }
+            KeyCode::Delete => {
+                cursor_index = buffer.delete_forward(cursor_index);
+                completion_state.clear_selection();
+                suggestions = completion_provider(&buffer.display());
+            }
+            KeyCode::Esc => {
+                completion_state.clear_selection();
+            }
+            KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+            KeyCode::Char(character) => {
+                cursor_index = buffer.insert_character(character, cursor_index);
+                completion_state.clear_selection();
+                suggestions = completion_provider(&buffer.display());
+            }
+            _ => {}
+        }
+    }
+}
+
+struct SubmitInputContext<'a> {
+    stdout: &'a mut std::io::Stdout,
+    previous_rows: usize,
+    prompt: &'a str,
+    buffer: &'a mut InputLineBuffer,
+    cursor_index: &'a mut usize,
+    completion_state: &'a mut InputCompletionState,
+    suggestions: &'a mut Vec<InteractiveCompletionSuggestion>,
+}
+
+fn submit_input_line<F>(
+    context: SubmitInputContext<'_>,
+    completion_provider: &mut F,
+) -> std::io::Result<Option<TerminalInputResult>>
+where
+    F: FnMut(&str) -> Vec<InteractiveCompletionSuggestion>,
+{
+    if let Some(acceptance) = context
+        .completion_state
+        .accept_selected_suggestion(context.buffer, context.suggestions)
+    {
+        *context.cursor_index = acceptance.cursor_index;
+        *context.suggestions = completion_provider(&context.buffer.display());
+        if !acceptance.should_submit {
+            return Ok(None);
+        }
+    }
+    clear_input_editor(context.stdout, context.previous_rows)?;
+    writeln!(
+        context.stdout,
+        "{}{}",
+        context.prompt,
+        context.buffer.display()
+    )?;
+    context.stdout.flush()?;
+    Ok(Some(TerminalInputResult::Submitted(
+        context.buffer.actual(),
+    )))
+}
+
+struct RawTerminalGuard;
+
+impl RawTerminalGuard {
+    fn activate(stdout: &mut std::io::Stdout) -> std::io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        execute!(stdout, EnableBracketedPaste)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, DisableBracketedPaste);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn render_input_editor(
+    stdout: &mut std::io::Stdout,
+    previous_rows: usize,
+    prompt: &str,
+    buffer: &InputLineBuffer,
+    cursor_index: usize,
+    suggestions: &[InteractiveCompletionSuggestion],
+    selected_suggestion_index: Option<usize>,
+) -> std::io::Result<usize> {
+    clear_input_editor(stdout, previous_rows)?;
+
+    let width = terminal_width();
+    let suggestion_lines = suggestion_lines(suggestions, selected_suggestion_index, width);
+    for line in &suggestion_lines {
+        writeln!(stdout, "{line}")?;
+    }
+
+    let display = buffer.rendered_display();
+    let ghost = ghost_suffix(&display, suggestions, selected_suggestion_index);
+    write!(stdout, "{prompt}{display}{}", dimmed(&ghost))?;
+
+    let end_column = visible_length(prompt) + visible_length(&display) + visible_length(&ghost);
+    let target_column = visible_length(prompt) + cursor_index.min(buffer.display_count());
+    if end_column > target_column {
+        queue!(
+            stdout,
+            cursor::MoveLeft((end_column - target_column).min(u16::MAX as usize) as u16)
+        )?;
+    }
+    stdout.flush()?;
+
+    Ok(suggestion_lines.len()
+        + wrapped_line_count(visible_length(prompt) + buffer.display_count(), width))
+}
+
+fn clear_input_editor(stdout: &mut std::io::Stdout, previous_rows: usize) -> std::io::Result<()> {
+    if previous_rows == 0 {
+        return Ok(());
+    }
+
+    queue!(
+        stdout,
+        cursor::MoveToColumn(0),
+        terminal::Clear(ClearType::CurrentLine)
+    )?;
+    for _ in 1..previous_rows {
+        queue!(
+            stdout,
+            cursor::MoveUp(1),
+            cursor::MoveToColumn(0),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+    }
+    stdout.flush()
+}
+
+fn suggestion_lines(
+    suggestions: &[InteractiveCompletionSuggestion],
+    selected_suggestion_index: Option<usize>,
+    width: usize,
+) -> Vec<String> {
+    if suggestions.is_empty() {
+        return Vec::new();
+    }
+
+    const VISIBLE_SUGGESTION_ROWS: usize = 3;
+    let start = suggestion_window_start(
+        suggestions.len(),
+        selected_suggestion_index,
+        VISIBLE_SUGGESTION_ROWS,
+    );
+    let end = (start + VISIBLE_SUGGESTION_ROWS).min(suggestions.len());
+    let command_width = suggestions[start..end]
+        .iter()
+        .map(|suggestion| visible_length(&suggestion.display))
+        .max()
+        .unwrap_or(0)
+        .clamp(8, 28);
+
+    let mut lines = Vec::new();
+    for (index, suggestion) in suggestions[start..end].iter().enumerate() {
+        let absolute_index = start + index;
+        let marker = if Some(absolute_index) == selected_suggestion_index {
+            "> "
+        } else {
+            "  "
+        };
+        let display = pad_end(
+            &truncate_end(&suggestion.display, command_width),
+            command_width,
+        );
+        let description = if suggestion.description.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", suggestion.description)
+        };
+        let line = format!(
+            "{marker}{}{}",
+            yellow(&display, Some(absolute_index) == selected_suggestion_index),
+            description
+        );
+        lines.push(truncate_end(&line, width));
+    }
+    lines.push(truncate_end(
+        &blue("tab complete  arrows select  enter run"),
+        width,
+    ));
+    lines
+}
+
+fn terminal_width() -> usize {
+    terminal::size()
+        .map(|(columns, _)| usize::from(columns).max(1))
+        .unwrap_or(120)
+}
+
+fn pad_end(value: &str, width: usize) -> String {
+    let value_length = visible_length(value);
+    if value_length >= width {
+        value.to_string()
+    } else {
+        format!("{value}{}", " ".repeat(width - value_length))
+    }
+}
+
+fn yellow(value: &str, bold: bool) -> String {
+    if bold {
+        format!("\u{001b}[1;33m{value}\u{001b}[0m")
+    } else {
+        format!("\u{001b}[33m{value}\u{001b}[0m")
+    }
+}
+
+fn blue(value: &str) -> String {
+    format!("\u{001b}[34m{value}\u{001b}[0m")
+}
+
+fn dimmed(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        format!("\u{001b}[90m{value}\u{001b}[0m")
+    }
 }
 
 pub fn suggestion_window_start(

@@ -21,6 +21,7 @@ bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
 clap = "4"
+crossterm = "0.29"
 core-foundation = "0.10"
 dirs = "6"
 futures-util = "0.3"

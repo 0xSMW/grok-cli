@@ -1,6 +1,14 @@
 use crate::input::wrapped_line_count;
 use crate::terminal::{truncate_end, visible_length};
+use anyhow::Result;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    queue,
+    terminal::{self, ClearType},
+};
 use std::collections::HashSet;
+use std::io::{IsTerminal, Write};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArrowSelection<T> {
@@ -93,6 +101,188 @@ where
         ArrowSelection::Cancelled => None,
         ArrowSelection::Unavailable => fallback(),
     }
+}
+
+pub fn select_index_from_terminal(
+    title: &str,
+    items: &[PickerItem],
+    current_id: Option<&str>,
+) -> Result<ArrowSelection<usize>> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(ArrowSelection::Unavailable);
+    }
+    if items.is_empty() {
+        return Ok(ArrowSelection::Cancelled);
+    }
+
+    let mut stdout = std::io::stdout();
+    let _guard = match PickerRawTerminalGuard::activate() {
+        Ok(guard) => guard,
+        Err(_) => return Ok(ArrowSelection::Unavailable),
+    };
+
+    let mut query = String::new();
+    let mut visible = visible_items(&query, items, false);
+    let mut selected_index = initial_index(&visible, current_id);
+    let mut previous_rows = 0;
+
+    loop {
+        if selected_index >= visible.len() {
+            selected_index = initial_index(&visible, current_id);
+        }
+        previous_rows = render_picker(
+            &mut stdout,
+            previous_rows,
+            title,
+            &query,
+            &visible,
+            selected_index,
+        )?;
+
+        let event = event::read()?;
+        let Event::Key(key) = event else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                clear_picker(&mut stdout, previous_rows)?;
+                writeln!(stdout)?;
+                stdout.flush()?;
+                return Ok(ArrowSelection::Cancelled);
+            }
+            KeyCode::Esc => {
+                clear_picker(&mut stdout, previous_rows)?;
+                stdout.flush()?;
+                return Ok(ArrowSelection::Cancelled);
+            }
+            KeyCode::Enter => {
+                if visible.is_empty() {
+                    continue;
+                }
+                let selected_item = &visible[selected_index.min(visible.len() - 1)];
+                let Some(original_index) =
+                    items.iter().position(|item| item.id == selected_item.id)
+                else {
+                    continue;
+                };
+                clear_picker(&mut stdout, previous_rows)?;
+                writeln!(stdout, "{}", selected_item.title)?;
+                stdout.flush()?;
+                return Ok(ArrowSelection::Selected(original_index));
+            }
+            KeyCode::Up => {
+                selected_index = next_index(selected_index, -1, &visible);
+            }
+            KeyCode::Down => {
+                selected_index = next_index(selected_index, 1, &visible);
+            }
+            KeyCode::PageUp => {
+                selected_index = next_page_index(selected_index, -8, &visible);
+            }
+            KeyCode::PageDown => {
+                selected_index = next_page_index(selected_index, 8, &visible);
+            }
+            KeyCode::Home => {
+                selected_index =
+                    initial_index(&visible, visible.first().map(|item| item.id.as_str()));
+            }
+            KeyCode::End => {
+                if let Some(last_enabled) = visible.iter().rposition(|item| item.is_enabled) {
+                    selected_index = last_enabled;
+                }
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                visible = visible_items(&query, items, false);
+                selected_index = initial_index(&visible, current_id);
+            }
+            KeyCode::Delete => {
+                query.clear();
+                visible = visible_items(&query, items, false);
+                selected_index = initial_index(&visible, current_id);
+            }
+            KeyCode::Char(character) => {
+                query.push(character);
+                visible = visible_items(&query, items, false);
+                selected_index = initial_index(&visible, current_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+struct PickerRawTerminalGuard;
+
+impl PickerRawTerminalGuard {
+    fn activate() -> std::io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for PickerRawTerminalGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn render_picker(
+    stdout: &mut std::io::Stdout,
+    previous_rows: usize,
+    title: &str,
+    query: &str,
+    items: &[PickerItem],
+    selected_index: usize,
+) -> std::io::Result<usize> {
+    clear_picker(stdout, previous_rows)?;
+    let width = terminal::size()
+        .map(|(columns, _)| usize::from(columns).max(1))
+        .unwrap_or(120);
+    let visible_limit = 8;
+    let start = visible_window_start(items.len(), selected_index as isize, visible_limit);
+    let end = (start + visible_limit).min(items.len());
+    let rendered = lines(
+        title,
+        query,
+        &items[start..end],
+        selected_index.saturating_sub(start) as isize,
+        width,
+        &PickerLineOptions::default(),
+    );
+    for (index, line) in rendered.iter().enumerate() {
+        if index + 1 == rendered.len() {
+            write!(stdout, "{line}")?;
+        } else {
+            writeln!(stdout, "{line}")?;
+        }
+    }
+    stdout.flush()?;
+    Ok(terminal_row_count(&rendered, width))
+}
+
+fn clear_picker(stdout: &mut std::io::Stdout, previous_rows: usize) -> std::io::Result<()> {
+    if previous_rows == 0 {
+        return Ok(());
+    }
+
+    queue!(
+        stdout,
+        cursor::MoveToColumn(0),
+        terminal::Clear(ClearType::CurrentLine)
+    )?;
+    for _ in 1..previous_rows {
+        queue!(
+            stdout,
+            cursor::MoveUp(1),
+            cursor::MoveToColumn(0),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+    }
+    stdout.flush()
 }
 
 pub fn visible_items(
