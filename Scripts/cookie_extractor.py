@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Extract grok.com cookies for the Swift Grok CLI.
+Extract grok.com cookies for grok-cli.
 
 The script avoids printing cookie values. JSON mode writes only the requested
-credentials file, while Swift mode is available for older embedding workflows.
+credentials file.
 """
 
 from __future__ import annotations
@@ -629,28 +629,6 @@ def write_json(cookies: Dict[str, str], output: str) -> None:
     os.chmod(output_path, 0o600)
 
 
-def swift_literal(cookies: Dict[str, str]) -> str:
-    lines = [
-        "import Foundation",
-        "",
-        "public struct GrokCookies {",
-        "    public static let cookies: [String: String] = [",
-    ]
-    for name, value in sorted(cookies.items()):
-        escaped_value = value.replace("\\", "\\\\").replace('"', '\\"')
-        escaped_name = name.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(f'        "{escaped_name}": "{escaped_value}",')
-    lines.extend(["    ]", "}", ""])
-    return "\n".join(lines)
-
-
-def write_swift(cookies: Dict[str, str], output: str) -> None:
-    output_path = Path(output).expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(swift_literal(cookies))
-    os.chmod(output_path, 0o600)
-
-
 def validate_required(cookies: Dict[str, str], strict: bool) -> bool:
     if not strict:
         return True
@@ -668,12 +646,6 @@ def validate_required(cookies: Dict[str, str], strict: bool) -> bool:
     return True
 
 
-def default_swift_output() -> str:
-    script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent if script_dir.name == "Scripts" else Path.cwd()
-    return str(project_root / "Sources" / "GrokClient" / "GrokCookies.swift")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Extract grok.com cookies for GrokCLI")
     parser.add_argument("--domain", default=".grok.com", help="Cookie domain to extract")
@@ -686,7 +658,7 @@ def main() -> int:
     parser.add_argument("--profile-dir", help="Explicit Chromium profile directory")
     parser.add_argument("--cookie-db", help="Explicit Chromium Cookies SQLite database")
     parser.add_argument("--devtools-url", help="Chrome DevTools HTTP URL for a browser launched with --remote-debugging-port")
-    parser.add_argument("--format", choices=["json", "swift", "both"], default="json")
+    parser.add_argument("--format", choices=["json"], default="json")
     parser.add_argument("--output", help="Output file")
     parser.add_argument("--required", action="store_true", help="Require login auth cookies")
     parser.add_argument("--quiet", action="store_true", help="Reduce progress output")
@@ -714,27 +686,12 @@ def main() -> int:
         print(f"Found {len(cookies)} grok.com cookies from {source_text}.")
         print(f"Auth-related cookies present: {', '.join(present) if present else 'none'}")
 
-    if args.format == "json":
-        if not args.output:
-            print("--output is required for JSON credentials", file=sys.stderr)
-            return 1
-        write_json(cookies, args.output)
-        if not args.quiet:
-            print(f"Wrote JSON credentials to {args.output}")
-    elif args.format == "swift":
-        output = args.output or default_swift_output()
-        write_swift(cookies, output)
-        if not args.quiet:
-            print(f"Wrote Swift credentials to {output}")
-    else:
-        if not args.output:
-            print("--output is required for combined output", file=sys.stderr)
-            return 1
-        write_json(cookies, args.output)
-        write_swift(cookies, default_swift_output())
-        if not args.quiet:
-            print(f"Wrote JSON credentials to {args.output}")
-            print(f"Wrote Swift credentials to {default_swift_output()}")
+    if not args.output:
+        print("--output is required for JSON credentials", file=sys.stderr)
+        return 1
+    write_json(cookies, args.output)
+    if not args.quiet:
+        print(f"Wrote JSON credentials to {args.output}")
 
     return 0
 

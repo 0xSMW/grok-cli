@@ -1,6 +1,5 @@
-# Swift & Package Manager
-.build/
-.swiftpm/
+# Rust
+target/
 
 # Python
 __pycache__/
@@ -15,7 +14,6 @@ __pycache__/
 !.env.example
 
 # Project specific
-GrokCookies.swift
 .plan/
 test-runs/
 credentials.json

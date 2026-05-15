@@ -1,6 +1,6 @@
 # Docker Setup for GrokProxy
 
-This document provides detailed instructions for running GrokProxy in Docker.
+This document provides detailed instructions for running the Rust `grok-proxy` binary in Docker.
 
 ## Prerequisites
 
@@ -25,8 +25,8 @@ environment:
 ### Option 2: Use an existing `credentials.json` file
 
 1. Generate a credentials file using one of these methods:
-   - Run `swift run grok auth` on your host machine
    - Run the proxy's setup script: `Scripts/setup_proxy.sh`
+   - Run `Scripts/cookie_extractor.py --format json --required --output credentials.json`
 
 2. Place the `credentials.json` file in the project root directory
 
@@ -36,13 +36,13 @@ environment:
 
 Browser-cookie extraction runs on the host. Generate or import `credentials.json` before starting Docker, then mount it into the container as `/app/credentials.json`.
 
-The runtime image starts the Swift proxy directly. It does not include Python or run `cookie_extractor.py`, so in-container credential generation is not supported.
+The runtime image starts the Rust proxy directly. It does not include Python or run `cookie_extractor.py`, so in-container credential generation is not supported.
 
 ## Building and Running
 
 ```bash
 # Navigate to the project directory
-cd path/to/swift-grok
+cd path/to/grok-cli
 
 # Build the Docker image
 docker compose build
@@ -109,7 +109,7 @@ The current configuration does not persist Grok conversations. Each Docker conta
 If you see errors like "Invalid credentials" or API requests failing:
 
 1. Verify your credentials.json file contains valid cookies
-2. Try regenerating the credentials with `swift run grok auth`
+2. Try regenerating the credentials with `Scripts/setup_proxy.sh`
 3. Check the container logs for error messages:
    ```bash
    docker compose logs app
@@ -120,14 +120,14 @@ If you see errors like "Invalid credentials" or API requests failing:
 If host-side cookie extraction fails:
 
 1. Ensure your browser has an active Grok session
-2. Run `Scripts/setup_proxy.sh` or `swift run grok auth` on the host
+2. Run `Scripts/setup_proxy.sh` on the host
 3. Check that the generated `credentials.json` exists in the project root
 
 ### Permission Issues
 
 If you see permission denied errors related to credentials:
 
-1. The Docker container runs as the `vapor` user
+1. The Docker container runs as the `grok` user
 2. Ensure mounted files are readable by other users:
    ```bash
    chmod 644 credentials.json

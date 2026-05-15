@@ -1,1 +1,0 @@
-try await GrokCLI.main()

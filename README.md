@@ -1,6 +1,6 @@
-# SwiftGrok
+# grok-cli
 
-SwiftGrok provides a Swift `GrokClient` library, an OpenAI-compatible proxy, and a terminal CLI named `grok`.
+grok-cli is a Rust-only Cargo workspace with a `grok-client` library, an OpenAI-compatible proxy, and a terminal CLI named `grok`.
 
 The CLI is designed for quick shell use. Bare text starts chat with an initial message:
 
@@ -10,8 +10,7 @@ grok how tall is the moon
 
 ## Requirements
 
-- macOS 14 or newer for the CLI
-- Swift 6 toolchain
+- Rust toolchain with Cargo and Rust 2024 edition support
 - Python 3 for browser-based authentication
 - A browser session logged in to [grok.com](https://grok.com)
 
@@ -20,12 +19,12 @@ grok how tall is the moon
 From a checkout:
 
 ```bash
-git clone https://github.com/klu-ai/swift-grok.git
-cd swift-grok
+git clone https://github.com/0xSMW/grok-cli.git
+cd grok-cli
 Scripts/install_cli.sh
 ```
 
-The installer builds the release `grok` product and copies:
+The installer builds the release `grok` binary with Cargo and copies:
 
 - `grok` to `/usr/local/bin` when writable, otherwise `~/.local/bin`
 - `cookie_extractor.py` beside the binary so `grok auth` can find it
@@ -36,7 +35,20 @@ Choose a specific install location when needed:
 Scripts/install_cli.sh --user
 Scripts/install_cli.sh --system
 Scripts/install_cli.sh --bin-dir "$HOME/bin"
-Scripts/install_cli.sh --prefix /opt/swift-grok
+Scripts/install_cli.sh --prefix /opt/grok-cli
+```
+
+For a checkout-local build without installing:
+
+```bash
+cargo build --workspace --bins
+cargo run -p grok-cli --bin grok -- help
+```
+
+Direct Cargo install is also available, but it only installs the `grok` binary. Use `Scripts/install_cli.sh` when you want the browser auth helper installed beside it.
+
+```bash
+cargo install --path crates/grok-cli --bin grok --root "$HOME/.local"
 ```
 
 If the install directory is not on `PATH`, add it to your shell profile:
@@ -82,7 +94,7 @@ test fixtures, and local mock servers.
 |----------------------|------------|----------|
 | `GROK_CONFIG_DIR` | CLI | Overrides the directory where `grok auth` saves `credentials.json`. Defaults to `$HOME/.config/grok-cli` on macOS and `$HOME/.grok-cli` on other platforms. |
 | `GROK_COOKIE_EXTRACTOR` | CLI | Overrides the path to `cookie_extractor.py` for `grok auth` and `grok auth generate`. Useful when the helper is installed outside the checkout or when tests need a fixture helper. |
-| `GROK_BASE_URL` | Swift client, CLI, proxy | Overrides the Grok REST base URL. Values may be a host, a `/rest` URL, or a `/rest/app-chat` URL; the client normalizes them to the app-chat and root REST endpoints. Useful for local mock servers and tests. |
+| `GROK_BASE_URL` | Rust client, CLI, proxy | Overrides the Grok REST base URL. Values may be a host, a `/rest` URL, or a `/rest/app-chat` URL; the client normalizes them to the app-chat and root REST endpoints. Useful for local mock servers and tests. |
 
 Credential handling has three related paths:
 
@@ -120,7 +132,7 @@ grok
 Send one message and exit:
 
 ```bash
-grok message explain Swift actors in one paragraph
+grok message explain Rust async in one paragraph
 ```
 
 Use stdin or a prompt file for longer prompts:
@@ -155,70 +167,15 @@ Attach documents to a one-shot message with repeatable `--file` / `--upload` opt
 grok message --file paper.pdf --raw --quiet "What is novel or meaningful from this document?"
 ```
 
-<!--
-Grok Code is disabled: the code harness concept will not work with grok.com because tool calls happen server side.
+## Disabled Commands
 
-## Grok Code
-
-`grok code` starts a local coding harness for repository work. Unlike `grok chat`, code mode keeps its own transcript, permission decisions, tool results, and agent roles so coding sessions do not depend on one long Grok web conversation.
-
-Start an interactive coding session:
-
-```bash
-grok code
-```
-
-Run one task from the shell:
-
-```bash
-grok code --model expert "review the proxy streaming path"
-grok code --model grok-4.3-beta --permission-mode ask "add retry coverage"
-```
-
-Code mode installs four temporary Grok agent customizations while it is running:
-
-- Strategy/coordinator for planning and task routing.
-- Architecture for system shape, interfaces, and integration risks.
-- Engineering for implementation details and focused code edits.
-- Security for credential, logging, and permission boundaries.
-
-### Settings Backup And Restore
-
-On entry, `grok code` fetches your Grok user settings and saves a raw backup under `~/.config/grok-cli/code-mode/settings-backups/`. It keeps the reusable Grok Code personas in `agentLibrary.agents`, backs up your current active agents into the library, and copies the four Grok Code library personas onto active slots 0-3. Before each remote role call, it activates that role through Grok settings and sends only task/context text. On normal exit, EOF, errors, and supported interrupts, it restores the original active agents and agent library from the raw backup.
-
-If automatic restore fails, the CLI prints the backup path and a recovery command:
+`grok code` is intentionally disabled in the Rust CLI. Running it prints:
 
 ```text
-grok code restore --backup ~/.config/grok-cli/code-mode/settings-backups/<timestamp>.json
+Grok Code is disabled: the code harness concept will not work with grok.com because tool calls happen server side.
 ```
 
-Keep these backup files private because they are snapshots of your account settings. They should not contain browser cookies, but they can contain custom agent names and instructions.
-
-### Permission Modes
-
-Code mode gates local tools before they run. The default is conservative and asks before actions that can modify files, run commands with side effects, or touch networked services.
-
-Common permission modes:
-
-- `--permission-mode ask`: prompt before unsafe or externally visible actions.
-- `--permission-mode read-only`: allow repository inspection only.
-- `--permission-mode workspace-write`: allow edits inside the current workspace while continuing to gate destructive or external actions.
-- `--permission-mode trusted`: allow the full local coding harness for sessions where you have already reviewed the task and repository scope.
-
-Use read-only mode for audits and planning:
-
-```bash
-grok code --permission-mode read-only "map the proxy request flow"
-```
-
-### Local Sample Task
-
-The repository includes a sample prompt for an end-to-end Grok Code fixture at `examples/grok-code/typescript-openai-proxy-task.md`. It asks Grok Code to create a local TypeScript OpenAI-compatible proxy fixture backed by this project, with no live network calls required during verification.
-
-```bash
-grok code --permission-mode workspace-write "$(cat examples/grok-code/typescript-openai-proxy-task.md)"
-```
--->
+Use `grok message`, `grok chat`, and the task/workspace/file commands for the supported Rust CLI flows.
 
 ## Audio And Transcription
 
@@ -259,37 +216,35 @@ Interactive chat supports audio slash commands:
 
 `/audio` with no path records WebM/Opus audio from the macOS default input microphone, transcribes the recording, and pre-fills the editable prompt so you can revise it before sending. `/audio <path>` and `/audio file <path>` use an existing audio file instead. `/audio send <path>` transcribes and sends immediately; `/audio-send <path>` remains as a legacy alias. Local recording currently uses `ffmpeg` on macOS. If you need to force a specific AVFoundation input, set `GROK_CLI_AUDIO_DEVICE` to a device name such as `MacBook Pro Microphone`, an index such as `1`, or `default`.
 
-Swift callers can use the speech-to-text helpers directly:
+Rust callers can use the speech-to-text helpers directly:
 
-```swift
-let client = try GrokClient(cookies: cookies)
+```rust
+use grok_client::{GrokClient, GrokSpeechToTextOptions};
 
-let fileTranscript = try await client.speechToText(
-    at: "/path/to/recording.webm"
-).text
+#[tokio::main]
+async fn main() -> grok_client::Result<()> {
+    let client = GrokClient::from_json_file("credentials.json", false, None)?;
 
-let dataTranscript = try await client.speechToText(
-    audioData: audioData,
-    audioFormat: "webm"
-).text
+    let file_transcript = client
+        .speech_to_text_file_response("recording.webm", &GrokSpeechToTextOptions::default())
+        .await?
+        .text;
 
-let base64Transcript = try await client.speechToText(
-    audioBase64: audioData.base64EncodedString(),
-    audioFormat: "webm",
-    refinementLevel: GrokClient.defaultSpeechRefinementLevel
-).text
+    println!("{file_transcript}");
+    Ok(())
+}
 ```
 
 ## JSON Output
 
 JSON mode reserves stdout for machine-readable JSON. Human progress/status banners are suppressed so stdout can be piped safely to tools such as `jq`; the `--debug` flag is reflected in result metadata instead of human debug lines.
 
-Every CLI command accepts `--json`, `--format json`, or `--format=json`:
+Every supported CLI command accepts `--json`, `--format json`, or `--format=json`:
 
 ```bash
-grok message --json "summarize Swift actors in two bullets"
-grok message --format json --model expert "explain AsyncSequence"
-grok chat --format=json "explain AsyncSequence"
+grok message --json "summarize Rust async in two bullets"
+grok message --format json --model expert "explain async streams"
+grok chat --format=json "explain async streams"
 grok models --json
 grok models --format json
 grok tasks list --format json
@@ -457,21 +412,27 @@ Interactive chat commands:
 
 In interactive chat, `/agents`, `/tasks`, `/skills`, `/workspaces`, and `/files` list by default. `/workspace`, `/attach`, and `/model` open pickers. Slash command groups are preferred for command-style input; unknown slash commands show an error, while unknown bare text is sent as chat.
 
-## Swift Package Usage
+## Rust Crate Usage
 
-Add the library to another Swift package:
+From this workspace, Rust code can depend on the Grok client crate:
 
-```swift
-dependencies: [
-    .package(url: "https://github.com/klu-ai/swift-grok", from: "0.2.0")
-]
+```toml
+[dependencies]
+grok-client = { path = "crates/grok-client" }
 ```
 
-Then depend on `GrokClient` from your target.
+Then import `GrokClient` from the `grok_client` crate.
 
 ## Proxy
 
 The `proxy` executable exposes an OpenAI-compatible API backed by Grok. See [PROXY_README.md](PROXY_README.md) for local setup and [DOCKER.md](DOCKER.md) for Docker-based setup.
+
+Build and run it from the Cargo workspace:
+
+```bash
+cargo build -p grok-proxy --bin proxy
+cargo run -p grok-proxy --bin proxy -- serve --hostname 127.0.0.1 --port 8080
+```
 
 ## Troubleshooting
 
@@ -479,17 +440,18 @@ The `proxy` executable exposes an OpenAI-compatible API backed by Grok. See [PRO
 - `Could not find cookie_extractor.py`: reinstall with `Scripts/install_cli.sh`; the helper should sit beside the `grok` binary.
 - Authentication errors: the CLI will tell you when saved cookies are rejected and will try to refresh them from your browser automatically. You can also run `/auth` inside interactive chat or `grok auth` from your shell.
 - Browser extraction fails: confirm Python 3 is installed and the browser is closed if its cookie store is locked.
-- Build fails: run `swift --version` and confirm Swift 6 is active.
+- Build fails: run `cargo --version` and confirm a current Rust toolchain is active.
 - Need more detail: add `--debug` to the command.
 
 ## Project Layout
 
-- `Sources/GrokClient/`: Swift client library and API models
-- `Sources/GrokCLI/`: `grok` command-line interface
-- `Sources/GrokProxy/`: OpenAI-compatible proxy server
-- `Scripts/`: installer and browser authentication helper
-- `Tests/`: package tests; see [Tests/README.md](Tests/README.md) for test and smoke commands
+- `crates/grok-client/`: Rust client library and API models
+- `crates/grok-cli/`: `grok` command-line interface
+- `crates/grok-proxy/`: OpenAI-compatible proxy server
+- `Scripts/`: installer, proxy helpers, and browser authentication helper
+- `crates/*/tests/`: Cargo integration and binary behavior tests
+- `Tests/`: Python cookie extractor test and test documentation
 
 ## License
 
-SwiftGrok is released under the MIT License. See [LICENSE](LICENSE) for details.
+grok-cli is released under the MIT License. See [LICENSE](LICENSE) for details.

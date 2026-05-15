@@ -1,6 +1,6 @@
-# GrokProxy: OpenAI-Compatible Proxy for Grok
+# grok-proxy: OpenAI-Compatible Proxy for Grok
 
-This project implements an OpenAI-compatible reverse proxy server for Grok, allowing applications designed to work with OpenAI's Chat Completions API to use Grok instead.
+This Rust-only Cargo workspace implements an OpenAI-compatible reverse proxy server for Grok, allowing applications designed to work with OpenAI's Chat Completions API to use Grok instead.
 
 ## Features
 
@@ -18,9 +18,9 @@ This project implements an OpenAI-compatible reverse proxy server for Grok, allo
 
 ### Prerequisites
 
-- Swift 6.0 or higher
-- Vapor 4.x
-- GrokClient (from the SwiftGrok package)
+- Rust toolchain with Cargo and Rust 2024 edition support
+- `grok-client` from this Cargo workspace
+- Python 3 when using `Scripts/setup_proxy.sh` to generate browser-cookie credentials
 
 ### Installation
 
@@ -28,12 +28,19 @@ This project implements an OpenAI-compatible reverse proxy server for Grok, allo
 2. Configure Grok credentials by either:
    - Setting `GROK_COOKIES` to a JSON object of cookie key-values
    - Creating a `credentials.json` file in the process current working directory with the same JSON shape
+   - Running `Scripts/setup_proxy.sh` to generate `credentials.json` from a logged-in browser session
    - Keeping credential files private; they contain browser cookies and should not be committed
 3. Build and run the application:
 
 ```bash
-swift build
-swift run proxy serve
+cargo build -p grok-proxy --bin proxy
+cargo run -p grok-proxy --bin proxy -- serve
+```
+
+Or use the setup-and-build helper:
+
+```bash
+Scripts/build.sh
 ```
 
 ### Running with Verbose Logging
@@ -42,13 +49,13 @@ For debugging purposes, you can enable verbose logging to see detailed request a
 
 ```bash
 # Using command line flag
-swift run proxy serve --verbose
+cargo run -p grok-proxy --bin proxy -- serve --verbose
 
 # With explicit bind settings
-swift run proxy serve --hostname 0.0.0.0 --port 8080 --verbose
+cargo run -p grok-proxy --bin proxy -- serve --hostname 0.0.0.0 --port 8080 --verbose
 
-# Or using environment variable
-VERBOSE=true swift run proxy serve
+# Or using the helper script
+Scripts/run_proxy_verbose.sh --hostname 0.0.0.0 --port 8080
 ```
 
 ## Usage
@@ -230,9 +237,10 @@ Example `credentials.json` file:
 
 ### Application Settings
 
-| Option | Environment Variable | Command Line Flag | Description |
-|--------|---------------------|-------------------|-------------|
-| Verbose Logging | `VERBOSE=true` | `--verbose` | Enables detailed logging of requests and responses |
+| Option | Interface | Description |
+|--------|-----------|-------------|
+| Verbose Logging | `serve --verbose` | Enables detailed logging of requests and responses |
+| Maximum Body Size | `GROK_PROXY_MAX_BODY_SIZE` environment variable | Sets the request body limit. Accepts plain bytes or `kb`, `mb`, and `gb` suffixes; defaults to 50 MB. |
 
 ## Parameter Mapping
 

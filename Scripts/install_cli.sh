@@ -10,7 +10,7 @@ usage() {
   cat <<'EOF'
 Usage: Scripts/install_cli.sh [options]
 
-Build and install the release grok CLI.
+Build and install the release grok CLI with Cargo.
 
 Options:
   --user              Install to ~/.local/bin
@@ -85,10 +85,14 @@ fi
 
 cd "$PROJECT_ROOT"
 
-echo "Building release grok binary..."
-swift build -c release --product grok
+echo "Building release grok binary with Cargo..."
+cargo build --release --package grok-cli --bin grok
 
-bin_path="$(swift build -c release --show-bin-path)/grok"
+target_dir="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+if [[ "$target_dir" != /* ]]; then
+  target_dir="$PROJECT_ROOT/$target_dir"
+fi
+bin_path="$target_dir/release/grok"
 if [[ ! -x "$bin_path" ]]; then
   echo "Error: built binary not found at $bin_path" >&2
   exit 1

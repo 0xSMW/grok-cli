@@ -1,30 +1,41 @@
 # Test Commands
 
-Run commands from the repository root unless noted.
+Run commands from the repository root unless noted. Cargo is the canonical validation surface for this Rust-only project; SwiftPM commands are retired and are not part of current validation.
 
-## Swift Package Tests
+## Cargo Validation
 
 Prerequisites:
 
-- Swift 6 toolchain. Check with `swift --version`.
-- macOS 14 or newer for CLI target assumptions and local audio command coverage.
-- No Grok account, browser session, or saved credentials are required. Networked behavior is covered with URL protocol mocks, an in-process Vapor app, or a local mock Grok server.
+- Rust toolchain with Cargo, rustfmt, and Clippy. Check with `cargo --version`, `cargo fmt --version`, and `cargo clippy --version`.
+- No Grok account, browser session, or saved credentials are required for automated Cargo tests. Networked behavior is covered with local mock servers or in-process Axum routes.
 
-Commands:
+Canonical commands:
 
 ```bash
-swift test
-swift test --filter GrokClientTests
-swift test --filter GrokProxyTests
-swift test --filter GrokCLIE2ETests
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Coverage:
+## Cargo Scope Map
 
-- `GrokClientTests`: client model and response decoding, endpoint selection, request payloads, model aliases, speech-to-text helpers, stream parsing, and mocked client request paths.
-- `GrokProxyTests`: in-process Vapor routes for `/hello`, `/v1/models`, `/models`, chat completion validation, audio transcription validation, response formats, and multipart audio conversion. These tests do not require a separately running proxy.
-- `GrokCLIE2ETests`: the `grok` executable against a local mock Grok server, including top-level commands, interactive chat, JSON and NDJSON output, auth import/generation paths with fake extractors, audio/transcription flows, model selection, resource commands, formatting, and error handling.
-- `AudioRecordingDeviceTests`: included in the CLI E2E test target and covers AVFoundation audio input argument formatting.
+Use the workspace command for full validation, then narrow to these commands while iterating:
+
+| Scope | Command | Coverage |
+| --- | --- | --- |
+| Full Rust workspace | `cargo test --workspace` | All `grok-client`, `grok-cli`, and `grok-proxy` unit and integration tests. |
+| Client library | `cargo test -p grok-client` | Model and response decoding, endpoint normalization, request payloads, options, JSON lookup, account/conversation/resource/task/sharing APIs, HTTP helpers, and stream parsing. |
+| CLI library and binary | `cargo test -p grok-cli` | CLI routing, option parsing, config, shell splitting, interactive parsing, terminal/table/HUD rendering, JSON and human output formatting, task formatting, typeahead, and binary-level behavior tests. |
+| CLI binary behavior harness | `cargo test -p grok-cli --test cli_binary_parity` | The `grok` executable against local mock Grok servers, including top-level commands, disabled command handling, JSON/NDJSON contracts, auth paths, message/audio/file/workspace/task flows, formatting, and error handling. |
+| Proxy crate | `cargo test -p grok-proxy` | In-process Axum routes for `/hello`, `/v1/models`, `/models`, chat completion validation, streaming server-sent events, audio transcription validation, CORS, credential loading, and body-size configuration. |
+
+Examples of focused test filters:
+
+```bash
+cargo test -p grok-client mode
+cargo test -p grok-cli --test cli_binary_parity message_json
+cargo test -p grok-proxy chat_completion
+```
 
 ## Python Cookie Extractor Tests
 
@@ -49,7 +60,7 @@ Coverage:
 
 ## Proxy Smoke Scripts
 
-These scripts are manual smoke checks, not `swift test` suites. They require a running proxy and may call Grok through real credentials.
+These scripts are manual smoke checks, not Cargo suites. They require a running proxy and may call Grok through real credentials.
 
 Prerequisites:
 
@@ -57,7 +68,7 @@ Prerequisites:
 - A running proxy on `http://127.0.0.1:8080` for the chat and model scripts. Start one with:
 
 ```bash
-swift run proxy serve
+cargo run -p grok-proxy --bin proxy -- serve
 ```
 
 - Valid proxy credentials, either by setting `GROK_COOKIES` to a JSON object of cookie key/value strings or by placing `credentials.json` in the proxy process working directory. `Scripts/setup_proxy.sh` can generate `credentials.json` from browser cookies when Python 3 and a logged-in browser session are available.
