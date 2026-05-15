@@ -2404,6 +2404,48 @@ fn interactive_search_routes_query_before_selection_like_swift()
 }
 
 #[test]
+fn interactive_empty_search_opens_live_picker_when_tty_like_swift()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("credentials.json"),
+        r#"{"sso":"cookie"}"#,
+    )?;
+    let server = JsonMockServer::spawn_sequence(vec![
+        r#"{"conversations":[{"conversationId":"conv-live-search","title":"Recent Project"}]}"#,
+        r#"{"responseNodes":[{"responseId":"resp-live-search","sender":"assistant"}]}"#,
+        r#"{"responses":[{"responseId":"resp-live-search","sender":"assistant","message":"Recent history","createTime":"2026-05-15T01:00:00Z"}]}"#,
+    ])?;
+
+    let output = grok()?
+        .env("GROK_CONFIG_DIR", temp_dir.path())
+        .env("GROK_BASE_URL", &server.base_url)
+        .env("GROK_CLI_FORCE_INTERACTIVE_TTY", "1")
+        .args(["chat"])
+        .write_stdin("/search\n1\n/quit\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output)?;
+    let requests = server.recorded_requests(3)?;
+
+    assert!(!stdout.contains("Usage: /search <query>"));
+    assert!(stdout.contains("Recent Project"));
+    assert_eq!(requests[0].path, "/rest/app-chat/conversations?pageSize=60");
+    assert_eq!(
+        requests[1].path,
+        "/rest/app-chat/conversations/conv-live-search/response-node"
+    );
+    assert_eq!(
+        requests[2].path,
+        "/rest/app-chat/conversations/conv-live-search/load-responses"
+    );
+    Ok(())
+}
+
+#[test]
 fn interactive_resource_slash_commands_delegate_to_ported_handlers_like_swift()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -3856,6 +3898,128 @@ fn agents_clear_json_posts_full_four_agent_profile_with_replace()
     assert_eq!(json["data"]["item"]["agentId"], 1);
     assert_eq!(json["data"]["item"]["instructionsRedacted"], true);
     assert!(!stdout.contains("Updated agent"));
+    Ok(())
+}
+
+#[test]
+fn agents_set_json_merges_current_profile_like_swift() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("credentials.json"),
+        r#"{"sso":"cookie"}"#,
+    )?;
+    let server = JsonMockServer::spawn_sequence(vec![
+        r#"{"agentCustomizations":{"values":[{"agentId":0,"name":"Grok","instructions":"base"},{"agentId":1,"name":"Research","instructions":"old"},{"agentId":2,"name":"Coder","instructions":"code"},{"agentId":3,"name":"Analyst","instructions":"analysis"}]}}"#,
+        r#"{}"#,
+    ])?;
+
+    let output = grok()?
+        .env("GROK_CONFIG_DIR", temp_dir.path())
+        .env("GROK_BASE_URL", &server.base_url)
+        .args([
+            "agents",
+            "set",
+            "1",
+            "--name",
+            "Deep Research",
+            "--instructions",
+            "Use primary sources",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output)?;
+    let json: Value = serde_json::from_str(&stdout)?;
+    let requests = server.recorded_requests(2)?;
+    let body: Value = serde_json::from_str(&requests[1].body)?;
+    let values = body["agentCustomizations"]["values"]
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("missing agent values"))?;
+
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/rest/user-settings");
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/rest/user-settings");
+    assert_eq!(values.len(), 4);
+    assert_eq!(values[0]["instructions"], "base");
+    assert_eq!(values[1]["agentId"], 1);
+    assert_eq!(values[1]["name"], "Deep Research");
+    assert_eq!(values[1]["instructions"], "Use primary sources");
+    assert_eq!(values[2]["instructions"], "code");
+    assert_eq!(json["schema"], "grok.cli.result.v1");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["command"], "agents");
+    assert_eq!(json["subcommand"], "set");
+    assert_eq!(json["data"]["action"], "set");
+    assert_eq!(json["data"]["id"], "1");
+    assert_eq!(json["data"]["rawRedacted"], true);
+    assert_eq!(json["data"]["item"]["name"], "Deep Research");
+    assert_eq!(json["data"]["item"]["instructions"], Value::Null);
+    assert!(!stdout.contains("Use primary sources"));
+    Ok(())
+}
+
+#[test]
+fn agents_edit_json_uses_quoted_editor_command_like_swift() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("credentials.json"),
+        r#"{"sso":"cookie"}"#,
+    )?;
+    let editor_dir = temp_dir.path().join("editor dir");
+    std::fs::create_dir(&editor_dir)?;
+    let editor_path = editor_dir.join("edit agent.sh");
+    std::fs::write(
+        &editor_path,
+        "#!/bin/sh\nprintf 'Edited instructions' > \"$1\"\n",
+    )?;
+    let mut permissions = std::fs::metadata(&editor_path)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&editor_path, permissions)?;
+    let server = JsonMockServer::spawn_sequence(vec![
+        r#"{"agentCustomizations":{"values":[{"agentId":0,"name":"Grok","instructions":"base"},{"agentId":1,"name":"Research","instructions":"old"}]}}"#,
+        r#"{}"#,
+    ])?;
+
+    let output = grok()?
+        .env("GROK_CONFIG_DIR", temp_dir.path())
+        .env("GROK_BASE_URL", &server.base_url)
+        .env("EDITOR", format!("\"{}\"", editor_path.display()))
+        .args(["agents", "edit", "1", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output)?;
+    let json: Value = serde_json::from_str(&stdout)?;
+    let requests = server.recorded_requests(2)?;
+    let body: Value = serde_json::from_str(&requests[1].body)?;
+    let values = body["agentCustomizations"]["values"]
+        .as_array()
+        .ok_or_else(|| std::io::Error::other("missing agent values"))?;
+
+    assert_eq!(requests[0].path, "/rest/user-settings");
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/rest/user-settings");
+    assert_eq!(values[1]["agentId"], 1);
+    assert_eq!(values[1]["name"], "Research");
+    assert_eq!(values[1]["instructions"], "Edited instructions");
+    assert_eq!(json["schema"], "grok.cli.result.v1");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["command"], "agents");
+    assert_eq!(json["subcommand"], "edit");
+    assert_eq!(json["data"]["action"], "edit");
+    assert_eq!(json["data"]["changed"], true);
+    assert_eq!(json["data"]["rawRedacted"], true);
+    assert_eq!(json["data"]["item"]["instructions"], Value::Null);
+    assert!(!stdout.contains("Edited instructions"));
     Ok(())
 }
 

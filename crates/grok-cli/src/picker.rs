@@ -108,6 +108,49 @@ pub fn select_index_from_terminal(
     items: &[PickerItem],
     current_id: Option<&str>,
 ) -> Result<ArrowSelection<usize>> {
+    let selection = select_item_from_terminal(title, items, current_id)?;
+    Ok(match selection {
+        ArrowSelection::Selected(item) => items
+            .iter()
+            .position(|candidate| candidate.id == item.id)
+            .map(ArrowSelection::Selected)
+            .unwrap_or(ArrowSelection::Cancelled),
+        ArrowSelection::Cancelled => ArrowSelection::Cancelled,
+        ArrowSelection::Unavailable => ArrowSelection::Unavailable,
+    })
+}
+
+pub fn select_item_from_terminal(
+    title: &str,
+    items: &[PickerItem],
+    current_id: Option<&str>,
+) -> Result<ArrowSelection<PickerItem>> {
+    select_item_from_terminal_inner::<fn(&str) -> Result<Vec<PickerItem>>>(
+        title, items, current_id, None,
+    )
+}
+
+pub fn select_item_from_terminal_with_remote<F>(
+    title: &str,
+    items: &[PickerItem],
+    current_id: Option<&str>,
+    remote_items_provider: F,
+) -> Result<ArrowSelection<PickerItem>>
+where
+    F: FnMut(&str) -> Result<Vec<PickerItem>>,
+{
+    select_item_from_terminal_inner(title, items, current_id, Some(remote_items_provider))
+}
+
+fn select_item_from_terminal_inner<F>(
+    title: &str,
+    items: &[PickerItem],
+    current_id: Option<&str>,
+    mut remote_items_provider: Option<F>,
+) -> Result<ArrowSelection<PickerItem>>
+where
+    F: FnMut(&str) -> Result<Vec<PickerItem>>,
+{
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(ArrowSelection::Unavailable);
     }
@@ -122,7 +165,9 @@ pub fn select_index_from_terminal(
     };
 
     let mut query = String::new();
-    let mut visible = visible_items(&query, items, false);
+    let uses_remote_items = remote_items_provider.is_some();
+    let mut displayed_items = items.to_vec();
+    let mut visible = visible_items(&query, &displayed_items, uses_remote_items);
     let mut selected_index = initial_index(&visible, current_id);
     let mut previous_rows = 0;
 
@@ -150,9 +195,10 @@ pub fn select_index_from_terminal(
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 clear_picker(&mut stdout, previous_rows)?;
-                write_raw_newline(&mut stdout)?;
+                write_raw_line(&mut stdout, "^C")?;
+                let _ = terminal::disable_raw_mode();
                 stdout.flush()?;
-                return Ok(ArrowSelection::Cancelled);
+                std::process::exit(130);
             }
             KeyCode::Esc => {
                 clear_picker(&mut stdout, previous_rows)?;
@@ -164,15 +210,10 @@ pub fn select_index_from_terminal(
                     continue;
                 }
                 let selected_item = &visible[selected_index.min(visible.len() - 1)];
-                let Some(original_index) =
-                    items.iter().position(|item| item.id == selected_item.id)
-                else {
-                    continue;
-                };
                 clear_picker(&mut stdout, previous_rows)?;
                 write_raw_line(&mut stdout, &selected_item.title)?;
                 stdout.flush()?;
-                return Ok(ArrowSelection::Selected(original_index));
+                return Ok(ArrowSelection::Selected(selected_item.clone()));
             }
             KeyCode::Up => {
                 selected_index = next_index(selected_index, -1, &visible);
@@ -197,21 +238,59 @@ pub fn select_index_from_terminal(
             }
             KeyCode::Backspace => {
                 query.pop();
-                visible = visible_items(&query, items, false);
+                refresh_remote_picker_items(
+                    &query,
+                    items,
+                    &mut displayed_items,
+                    &mut remote_items_provider,
+                );
+                visible = visible_items(&query, &displayed_items, uses_remote_items);
                 selected_index = initial_index(&visible, current_id);
             }
             KeyCode::Delete => {
                 query.clear();
-                visible = visible_items(&query, items, false);
+                refresh_remote_picker_items(
+                    &query,
+                    items,
+                    &mut displayed_items,
+                    &mut remote_items_provider,
+                );
+                visible = visible_items(&query, &displayed_items, uses_remote_items);
                 selected_index = initial_index(&visible, current_id);
             }
             KeyCode::Char(character) => {
                 query.push(character);
-                visible = visible_items(&query, items, false);
+                refresh_remote_picker_items(
+                    &query,
+                    items,
+                    &mut displayed_items,
+                    &mut remote_items_provider,
+                );
+                visible = visible_items(&query, &displayed_items, uses_remote_items);
                 selected_index = initial_index(&visible, current_id);
             }
             _ => {}
         }
+    }
+}
+
+fn refresh_remote_picker_items<F>(
+    query: &str,
+    initial_items: &[PickerItem],
+    displayed_items: &mut Vec<PickerItem>,
+    remote_items_provider: &mut Option<F>,
+) where
+    F: FnMut(&str) -> Result<Vec<PickerItem>>,
+{
+    let Some(remote_items_provider) = remote_items_provider.as_mut() else {
+        return;
+    };
+    if query.trim().is_empty() {
+        *displayed_items = initial_items.to_vec();
+        return;
+    }
+    if let Ok(items) = remote_items_provider(query) {
+        *displayed_items = items;
     }
 }
 
@@ -266,10 +345,6 @@ fn render_picker(
 
 fn write_raw_line(stdout: &mut std::io::Stdout, line: &str) -> std::io::Result<()> {
     write!(stdout, "{line}\r\n")
-}
-
-fn write_raw_newline(stdout: &mut std::io::Stdout) -> std::io::Result<()> {
-    write!(stdout, "\r\n")
 }
 
 fn clear_picker(stdout: &mut std::io::Stdout, previous_rows: usize) -> std::io::Result<()> {

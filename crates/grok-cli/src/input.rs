@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum InputSegment {
@@ -399,6 +400,43 @@ pub struct InputCompletionAcceptance {
     pub should_submit: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InputHistory {
+    entries: Vec<String>,
+    index: usize,
+}
+
+impl InputHistory {
+    pub fn record(&mut self, input: &str) {
+        if input.is_empty() {
+            return;
+        }
+        self.entries.push(input.to_string());
+        self.index = self.entries.len();
+    }
+
+    pub fn reset_navigation(&mut self) {
+        self.index = self.entries.len();
+    }
+
+    pub fn previous_command(&mut self) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        self.index = self.index.saturating_sub(1);
+        self.entries.get(self.index).cloned()
+    }
+
+    pub fn next_command(&mut self) -> Option<String> {
+        if self.index + 1 < self.entries.len() {
+            self.index += 1;
+            return self.entries.get(self.index).cloned();
+        }
+        self.index = self.entries.len();
+        None
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum TerminalInputResult {
     Submitted(String),
@@ -409,6 +447,19 @@ pub enum TerminalInputResult {
 pub fn read_terminal_line<F>(
     prompt: &str,
     prefill: &str,
+    completion_provider: F,
+) -> Result<TerminalInputResult>
+where
+    F: FnMut(&str) -> Vec<InteractiveCompletionSuggestion>,
+{
+    let mut history = InputHistory::default();
+    read_terminal_line_with_history(prompt, prefill, &mut history, completion_provider)
+}
+
+pub fn read_terminal_line_with_history<F>(
+    prompt: &str,
+    prefill: &str,
+    history: &mut InputHistory,
     mut completion_provider: F,
 ) -> Result<TerminalInputResult>
 where
@@ -429,17 +480,37 @@ where
     let mut completion_state = InputCompletionState::default();
     let mut suggestions = completion_provider(&buffer.display());
     let mut previous_render = RenderedInputBlock::default();
+    let mut needs_render = true;
+    history.reset_navigation();
 
     loop {
-        previous_render = render_input_editor(
-            &mut stdout,
-            previous_render,
-            prompt,
-            &buffer,
-            cursor_index,
-            &suggestions,
-            completion_state.selected_suggestion_index(),
-        )?;
+        if needs_render {
+            previous_render = render_input_editor(
+                &mut stdout,
+                previous_render,
+                prompt,
+                &buffer,
+                cursor_index,
+                &suggestions,
+                completion_state.selected_suggestion_index(),
+            )?;
+            needs_render = false;
+        }
+
+        if !event::poll(Duration::from_millis(50))? {
+            let next_suggestions = completion_provider(&buffer.display());
+            if next_suggestions != suggestions {
+                suggestions = next_suggestions;
+                if completion_state
+                    .selected_suggestion_index()
+                    .is_some_and(|index| index >= suggestions.len())
+                {
+                    completion_state.clear_selection();
+                }
+                needs_render = true;
+            }
+            continue;
+        }
 
         let event = event::read()?;
         let Event::Key(key) = event else {
@@ -447,19 +518,23 @@ where
                 cursor_index = buffer.insert_pasted_content(&content, cursor_index);
                 completion_state.clear_selection();
                 suggestions = completion_provider(&buffer.display());
+                needs_render = true;
             }
             continue;
         };
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        needs_render = true;
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 clear_input_editor(&mut stdout, previous_render)?;
-                write_raw_newline(&mut stdout)?;
+                write_raw_line(&mut stdout, "^C")?;
+                let _ = execute!(stdout, DisableBracketedPaste);
+                let _ = terminal::disable_raw_mode();
                 stdout.flush()?;
-                return Ok(TerminalInputResult::Cancelled);
+                std::process::exit(130);
             }
             KeyCode::Char('d')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && buffer.display_count() == 0 =>
@@ -482,6 +557,9 @@ where
                     },
                     &mut completion_provider,
                 )? {
+                    if let TerminalInputResult::Submitted(line) = &result {
+                        history.record(line);
+                    }
                     return Ok(result);
                 }
             }
@@ -512,6 +590,9 @@ where
                     },
                     &mut completion_provider,
                 )? {
+                    if let TerminalInputResult::Submitted(line) = &result {
+                        history.record(line);
+                    }
                     return Ok(result);
                 }
             }
@@ -523,11 +604,26 @@ where
                 continue;
             }
             KeyCode::Up => {
-                let _ = completion_state.move_suggestion_selection(-1, &suggestions);
+                if !completion_state.move_suggestion_selection(-1, &suggestions)
+                    && let Some(previous) = history.previous_command()
+                {
+                    buffer.replace_with_committed_text(&previous);
+                    cursor_index = buffer.display_count();
+                    completion_state.clear_selection();
+                    suggestions = completion_provider(&buffer.display());
+                }
             }
-            KeyCode::Down => {
-                let _ = completion_state.move_suggestion_selection(1, &suggestions);
+            KeyCode::Down if !completion_state.move_suggestion_selection(1, &suggestions) => {
+                if let Some(next) = history.next_command() {
+                    buffer.replace_with_committed_text(&next);
+                } else {
+                    buffer.clear();
+                }
+                cursor_index = buffer.display_count();
+                completion_state.clear_selection();
+                suggestions = completion_provider(&buffer.display());
             }
+            KeyCode::Down => {}
             KeyCode::Left => {
                 cursor_index = cursor_index.saturating_sub(1);
                 completion_state.clear_selection();
@@ -663,21 +759,63 @@ fn render_input_editor(
     let ghost = ghost_suffix(&display, suggestions, selected_suggestion_index);
     write!(stdout, "{prompt}{display}{}", dimmed(&ghost))?;
 
-    let end_column = visible_length(prompt) + visible_length(&display) + visible_length(&ghost);
-    let target_column = visible_length(prompt) + cursor_index.min(buffer.display_count());
-    if end_column > target_column {
+    let metrics = normal_input_render_metrics(
+        prompt,
+        &display,
+        cursor_index.min(buffer.display_count()),
+        &ghost,
+        suggestion_lines.len(),
+        width,
+    );
+    if metrics.lines_up > 0 {
         queue!(
             stdout,
-            cursor::MoveLeft((end_column - target_column).min(u16::MAX as usize) as u16)
+            cursor::MoveUp(metrics.lines_up.min(u16::MAX as usize) as u16)
+        )?;
+    }
+    queue!(stdout, cursor::MoveToColumn(0))?;
+    if metrics.target_position.column > 0 {
+        queue!(
+            stdout,
+            cursor::MoveRight(metrics.target_position.column.min(u16::MAX as usize) as u16)
         )?;
     }
     stdout.flush()?;
 
     Ok(RenderedInputBlock {
-        rows: suggestion_lines.len()
-            + wrapped_line_count(visible_length(prompt) + buffer.display_count(), width),
-        cursor_row: suggestion_lines.len(),
+        rows: suggestion_lines.len() + metrics.input_rows,
+        cursor_row: suggestion_lines.len() + metrics.target_position.row,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NormalInputRenderMetrics {
+    input_rows: usize,
+    target_position: WrappedCursorPosition,
+    lines_up: usize,
+}
+
+fn normal_input_render_metrics(
+    prompt: &str,
+    display: &str,
+    cursor_index: usize,
+    ghost: &str,
+    suggestion_line_count: usize,
+    width: usize,
+) -> NormalInputRenderMetrics {
+    let prompt_length = visible_length(prompt);
+    let input_length = prompt_length + visible_length(display) + visible_length(ghost);
+    let input_rows = wrapped_line_count(input_length, width);
+    let target_position =
+        wrapped_cursor_position(prompt_length + cursor_index, input_length, width);
+    let current_position = wrapped_cursor_position(input_length, input_length, width);
+    let target_block_row = suggestion_line_count + target_position.row;
+    let current_block_row = suggestion_line_count + current_position.row;
+    NormalInputRenderMetrics {
+        input_rows,
+        target_position,
+        lines_up: current_block_row.saturating_sub(target_block_row),
+    }
 }
 
 fn render_slash_command_editor(
@@ -1012,9 +1150,10 @@ fn remove_char_at(text: &str, offset: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputCompletionAcceptance, InputCompletionState, InputLineBuffer, WrappedCursorPosition,
-        ghost_suffix, longest_common_prefix, slash_command_suggestion_lines,
-        suggestion_window_start, wrapped_cursor_position, wrapped_line_count,
+        InputCompletionAcceptance, InputCompletionState, InputHistory, InputLineBuffer,
+        WrappedCursorPosition, ghost_suffix, longest_common_prefix, normal_input_render_metrics,
+        slash_command_suggestion_lines, suggestion_window_start, wrapped_cursor_position,
+        wrapped_line_count,
     };
     use crate::InteractiveCompletionSuggestion;
     use crate::terminal::strip_ansi;
@@ -1171,6 +1310,23 @@ mod tests {
     }
 
     #[test]
+    fn input_history_navigation_matches_swift_arrow_recall() {
+        let mut history = InputHistory::default();
+        assert_eq!(history.previous_command(), None);
+
+        history.record("first prompt");
+        history.record("second prompt");
+        history.reset_navigation();
+
+        assert_eq!(history.previous_command().as_deref(), Some("second prompt"));
+        assert_eq!(history.previous_command().as_deref(), Some("first prompt"));
+        assert_eq!(history.previous_command().as_deref(), Some("first prompt"));
+        assert_eq!(history.next_command().as_deref(), Some("second prompt"));
+        assert_eq!(history.next_command(), None);
+        assert_eq!(history.next_command(), None);
+    }
+
+    #[test]
     fn slash_completion_renderer_lists_all_commands_below_prompt_like_swift() {
         let suggestions = vec![
             completion("/model", "/model", false, true),
@@ -1226,5 +1382,17 @@ mod tests {
             wrapped_cursor_position(3, 3, 0),
             WrappedCursorPosition { row: 2, column: 0 }
         );
+    }
+
+    #[test]
+    fn normal_input_render_metrics_account_for_wrapped_ghost_suffix_like_swift() {
+        let metrics = normal_input_render_metrics("> ", "abcdefgh", 3, "ijklmnop", 2, 10);
+
+        assert_eq!(metrics.input_rows, 2);
+        assert_eq!(
+            metrics.target_position,
+            WrappedCursorPosition { row: 0, column: 5 }
+        );
+        assert_eq!(metrics.lines_up, 1);
     }
 }

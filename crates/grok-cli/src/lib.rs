@@ -502,12 +502,19 @@ async fn run_chat_command(
 
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
+    let mut input_history = input::InputHistory::default();
     loop {
         if live_output {
             output.extend(interactive_status_lines(&parsed));
         }
-        let Some(line) =
-            read_interactive_prompt_line(&mut lines, &mut output, live_output, "> ", &parsed)?
+        let Some(line) = read_interactive_prompt_line(
+            &mut lines,
+            &mut output,
+            live_output,
+            "> ",
+            &parsed,
+            &mut input_history,
+        )?
         else {
             break;
         };
@@ -731,7 +738,10 @@ async fn run_chat_command(
                         &mut conversation_id,
                         &mut parent_response_id,
                         &mut output,
-                        GrokConversationListOptions::default(),
+                        InteractiveConversationSelectionOptions {
+                            list: GrokConversationListOptions::default(),
+                            live_search: false,
+                        },
                         live_output,
                     )
                     .await
@@ -741,7 +751,7 @@ async fn run_chat_command(
                     }
                 }
                 "search" => {
-                    if args.is_empty() {
+                    if args.is_empty() && !live_output {
                         output.push("Usage: /search <query>".to_string());
                         continue;
                     }
@@ -751,9 +761,12 @@ async fn run_chat_command(
                         &mut conversation_id,
                         &mut parent_response_id,
                         &mut output,
-                        GrokConversationListOptions {
-                            page_size: 60,
-                            search_query: Some(args.join(" ")),
+                        InteractiveConversationSelectionOptions {
+                            list: GrokConversationListOptions {
+                                page_size: 60,
+                                search_query: (!args.is_empty()).then(|| args.join(" ")),
+                            },
+                            live_search: args.is_empty(),
                         },
                         live_output,
                     )
@@ -1426,25 +1439,31 @@ fn read_interactive_prompt_line(
     live_output: bool,
     prompt: &str,
     parsed: &ParsedChatCommand,
+    input_history: &mut input::InputHistory,
 ) -> Result<Option<String>> {
     flush_interactive_output(output, live_output);
     if live_output {
-        let mut remote_cache: std::collections::HashMap<String, Vec<InputTypeaheadSuggestion>> =
-            std::collections::HashMap::new();
-        let result = input::read_terminal_line(prompt, "", |buffer| {
+        let debug = parsed.debug;
+        let mut typeahead_controller = RemoteTypeaheadController::new();
+        let mut in_flight_typeahead_queries = HashSet::new();
+        let (typeahead_sender, typeahead_receiver) =
+            std::sync::mpsc::channel::<(String, Vec<InputTypeaheadSuggestion>)>();
+        let result = input::read_terminal_line_with_history(prompt, "", input_history, |buffer| {
+            while let Ok((query, suggestions)) = typeahead_receiver.try_recv() {
+                in_flight_typeahead_queries.remove(&query);
+                typeahead_controller.store(&query, suggestions, std::time::SystemTime::now());
+            }
+
             let remote_suggestions = if parsed.typeahead_enabled {
-                let query = remote_typeahead_query(buffer);
-                query
-                    .and_then(|query| {
-                        if !remote_cache.contains_key(&query) {
-                            let suggestions =
-                                fetch_remote_typeahead_suggestions(&query, parsed.debug);
-                            remote_cache.insert(query.clone(), suggestions);
-                        }
-                        remote_cache.get(&query).cloned()
-                    })
-                    .unwrap_or_default()
+                let now = std::time::SystemTime::now();
+                if let Some(query) = typeahead_controller.observe(buffer, now)
+                    && in_flight_typeahead_queries.insert(query.clone())
+                {
+                    spawn_remote_typeahead_fetch(query, debug, typeahead_sender.clone());
+                }
+                typeahead_controller.suggestions(buffer, now)
             } else {
+                typeahead_controller.reset();
                 Vec::new()
             };
             interactive_completion_suggestions(buffer, &remote_suggestions)
@@ -1462,37 +1481,32 @@ fn read_interactive_prompt_line(
     Ok(lines.next().transpose()?)
 }
 
-fn remote_typeahead_query(buffer: &str) -> Option<String> {
-    let trimmed = buffer.trim();
-    if trimmed.chars().count() < 2
-        || trimmed.starts_with('/')
-        || trimmed.starts_with("[Pasted content ")
-        || trimmed.contains('\n')
-        || trimmed.contains('\r')
-    {
-        return None;
-    }
-    Some(trimmed.to_string())
+fn spawn_remote_typeahead_fetch(
+    query: String,
+    debug: bool,
+    sender: std::sync::mpsc::Sender<(String, Vec<InputTypeaheadSuggestion>)>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let suggestions = fetch_remote_typeahead_suggestions(query.clone(), debug)
+            .await
+            .unwrap_or_default();
+        let _ = sender.send((query, suggestions));
+    });
 }
 
-fn fetch_remote_typeahead_suggestions(query: &str, debug: bool) -> Vec<InputTypeaheadSuggestion> {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return Vec::new();
-    };
-    let query = query.to_string();
-    let result = tokio::task::block_in_place(|| {
-        handle.block_on(async move {
-            let client = configured_client(debug)?;
-            let response = client
-                .typeahead_response(&query, "en-US", 3, "web", 2)
-                .await?;
-            Ok::<_, anyhow::Error>(RemoteTypeaheadController::normalize_remote_suggestions(
-                response.suggestions,
-                3,
-            ))
-        })
-    });
-    result.unwrap_or_default()
+async fn fetch_remote_typeahead_suggestions(
+    query: String,
+    debug: bool,
+) -> Result<Vec<InputTypeaheadSuggestion>> {
+    let client = configured_client(debug)?;
+    let response = client
+        .typeahead_response(&query, "en-US", 3, "web", 2)
+        .await?;
+    Ok(RemoteTypeaheadController::normalize_remote_suggestions(
+        response.suggestions,
+        3,
+    ))
 }
 
 fn clear_interactive_screen(live_output: bool) {
@@ -1635,6 +1649,7 @@ async fn stream_interactive_chat_turn(
 
     let mut stream_parser = GrokStreamParser::new(conversation_id.unwrap_or(""));
     let mut answer_parser = GrokStreamMarkupParser::new();
+    let mut markdown_printer = InteractiveMarkdownStreamPrinter::default();
     let mut printed_answer_header = false;
     let mut printed_any_answer = false;
     let mut accumulated_message = String::new();
@@ -1660,7 +1675,10 @@ async fn stream_interactive_chat_turn(
                         &mut printed_answer_header,
                     );
                 } else {
-                    let _ = answer_parser.consume(&response.message);
+                    printed_any_answer |= markdown_printer.print_events(
+                        answer_parser.consume(&response.message),
+                        &mut printed_answer_header,
+                    );
                 }
             }
             latest_response = Some(response);
@@ -1678,7 +1696,9 @@ async fn stream_interactive_chat_turn(
         printed_any_answer |=
             print_interactive_stream_events(answer_parser.finish(), &mut printed_answer_header);
     } else {
-        let _ = answer_parser.finish();
+        printed_any_answer |=
+            markdown_printer.print_events(answer_parser.finish(), &mut printed_answer_header);
+        printed_any_answer |= markdown_printer.finish(&mut printed_answer_header);
     }
 
     if let Some(response) = final_response {
@@ -1738,6 +1758,61 @@ fn print_interactive_stream_events(
     printed_text
 }
 
+#[derive(Default)]
+struct InteractiveMarkdownStreamPrinter {
+    buffer: String,
+}
+
+impl InteractiveMarkdownStreamPrinter {
+    fn print_events(
+        &mut self,
+        events: Vec<StreamDisplayEvent>,
+        printed_answer_header: &mut bool,
+    ) -> bool {
+        let mut printed_text = false;
+        for event in events {
+            let StreamDisplayEvent::Text(text) = event else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            self.buffer.push_str(&text);
+            printed_text |= self.flush_complete_lines(printed_answer_header);
+        }
+        printed_text
+    }
+
+    fn finish(&mut self, printed_answer_header: &mut bool) -> bool {
+        if self.buffer.is_empty() {
+            return false;
+        }
+        print_interactive_answer_header(printed_answer_header);
+        print!("{}", render_terminal_markdown_subset(&self.buffer));
+        self.buffer.clear();
+        let _ = std::io::stdout().flush();
+        true
+    }
+
+    fn flush_complete_lines(&mut self, printed_answer_header: &mut bool) -> bool {
+        let mut printed_text = false;
+        while let Some(newline_index) = self.buffer.find('\n') {
+            let mut line = self.buffer[..newline_index].to_string();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            print_interactive_answer_header(printed_answer_header);
+            println!("{}", render_terminal_markdown_subset(&line));
+            self.buffer.drain(..=newline_index);
+            printed_text = true;
+        }
+        if printed_text {
+            let _ = std::io::stdout().flush();
+        }
+        printed_text
+    }
+}
+
 fn print_interactive_response_body(message: &str, raw: bool, printed_answer_header: &mut bool) {
     let visible = message_output_text(message, raw);
     if visible.is_empty() {
@@ -1777,28 +1852,40 @@ fn message_indicates_authentication_failure(message: &str) -> bool {
         || normalized.contains("sso")
 }
 
+struct InteractiveConversationSelectionOptions {
+    list: GrokConversationListOptions,
+    live_search: bool,
+}
+
 async fn select_interactive_conversation(
     lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
     parsed: &mut ParsedChatCommand,
     conversation_id: &mut Option<String>,
     parent_response_id: &mut Option<String>,
     output: &mut Vec<String>,
-    list_options: GrokConversationListOptions,
+    options: InteractiveConversationSelectionOptions,
     live_output: bool,
 ) -> Result<()> {
     let client = configured_client(parsed.debug)?;
-    let response = client.list_conversations_response(&list_options).await?;
+    let response = client.list_conversations_response(&options.list).await?;
     let conversations = response.conversations;
-    if conversations.is_empty() {
+    if conversations.is_empty() && !options.live_search {
         output.push("No conversations found.".to_string());
         return Ok(());
     }
 
-    let selected_index = if live_output {
+    let selected_conversation = if live_output && options.live_search {
         flush_interactive_output(output, live_output);
         let items = conversation_picker_items(&conversations);
-        match picker::select_index_from_terminal("Select conversation", &items, None)? {
-            picker::ArrowSelection::Selected(index) => Some(index),
+        match picker::select_item_from_terminal_with_remote(
+            "Search conversations",
+            &items,
+            None,
+            |query| {
+                live_search_conversation_picker_items(query, options.list.page_size, parsed.debug)
+            },
+        )? {
+            picker::ArrowSelection::Selected(item) => Some((item.id, item.title)),
             picker::ArrowSelection::Cancelled => None,
             picker::ArrowSelection::Unavailable => select_interactive_numbered_index(
                 lines,
@@ -1808,7 +1895,34 @@ async fn select_interactive_conversation(
                 "Select a conversation by number: ",
                 conversations.len(),
                 false,
-            )?,
+            )?
+            .map(|index| {
+                let selected = &conversations[index];
+                (selected.conversation_id.clone(), selected.title.clone())
+            }),
+        }
+    } else if live_output {
+        flush_interactive_output(output, live_output);
+        let items = conversation_picker_items(&conversations);
+        match picker::select_index_from_terminal("Select conversation", &items, None)? {
+            picker::ArrowSelection::Selected(index) => {
+                let selected = &conversations[index];
+                Some((selected.conversation_id.clone(), selected.title.clone()))
+            }
+            picker::ArrowSelection::Cancelled => None,
+            picker::ArrowSelection::Unavailable => select_interactive_numbered_index(
+                lines,
+                output,
+                live_output,
+                conversation_rows(&conversations),
+                "Select a conversation by number: ",
+                conversations.len(),
+                false,
+            )?
+            .map(|index| {
+                let selected = &conversations[index];
+                (selected.conversation_id.clone(), selected.title.clone())
+            }),
         }
     } else {
         select_interactive_numbered_index(
@@ -1820,17 +1934,20 @@ async fn select_interactive_conversation(
             conversations.len(),
             false,
         )?
+        .map(|index| {
+            let selected = &conversations[index];
+            (selected.conversation_id.clone(), selected.title.clone())
+        })
     };
 
-    let Some(selected_index) = selected_index else {
+    let Some((selected_conversation_id, selected_title)) = selected_conversation else {
         return Ok(());
     };
-    let selected = &conversations[selected_index];
-    output.push(format!("Loading conversation \"{}\"...", selected.title));
+    output.push(format!("Loading conversation \"{selected_title}\"..."));
     let responses = client
-        .load_responses(&selected.conversation_id, None)
+        .load_responses(&selected_conversation_id, None)
         .await?;
-    *conversation_id = Some(selected.conversation_id.clone());
+    *conversation_id = Some(selected_conversation_id);
     *parent_response_id = continuation_parent_response_id(&responses);
     if let Some(mode) = most_recent_response_mode(&responses) {
         parsed.selected_mode = mode;
@@ -1840,9 +1957,29 @@ async fn select_interactive_conversation(
         ));
     }
 
-    output.push(selected.title.clone());
+    output.push(selected_title);
     output.push(conversation_history_rows(&responses));
     Ok(())
+}
+
+fn live_search_conversation_picker_items(
+    query: &str,
+    page_size: usize,
+    debug: bool,
+) -> Result<Vec<picker::PickerItem>> {
+    let query = query.trim().to_string();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async move {
+            let client = configured_client(debug)?;
+            let response = client
+                .list_conversations_response(&GrokConversationListOptions {
+                    page_size,
+                    search_query: (!query.is_empty()).then_some(query),
+                })
+                .await?;
+            Ok::<_, anyhow::Error>(conversation_picker_items(&response.conversations))
+        })
+    })
 }
 
 async fn select_interactive_workspace(
@@ -7203,10 +7340,10 @@ fn edit_agent_instructions(agent: &GrokAgentCustomization) -> Result<String> {
         .or_else(|| std::env::var("EDITOR").ok())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "vi".to_string());
-    let mut parts = editor.split_whitespace().collect::<Vec<_>>();
+    let mut parts = shell::split_command_arguments(&editor)?;
     let executable = parts
         .first()
-        .copied()
+        .map(String::as_str)
         .ok_or_else(|| anyhow::anyhow!("EDITOR is empty."))?;
     let mut command = if executable.contains('/') {
         ProcessCommand::new(expand_tilde_path(PathBuf::from(executable)))
@@ -9789,6 +9926,16 @@ mod tests {
         assert!(
             !interactive_completion_suggestion_displays("/", &remote_suggestions)
                 .contains(&"test driven development".to_string())
+        );
+    }
+
+    #[test]
+    fn terminal_markdown_subset_strips_inline_markers_like_swift_console() {
+        assert_eq!(
+            render_terminal_markdown_subset(
+                "# Heading\n**Hello Stephen.**\nSee [docs](https://example.com)."
+            ),
+            "Heading\nHello Stephen.\nSee docs."
         );
     }
 
