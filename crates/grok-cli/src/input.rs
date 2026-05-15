@@ -428,12 +428,12 @@ where
     let mut cursor_index = buffer.display_count();
     let mut completion_state = InputCompletionState::default();
     let mut suggestions = completion_provider(&buffer.display());
-    let mut previous_rows = 0;
+    let mut previous_render = RenderedInputBlock::default();
 
     loop {
-        previous_rows = render_input_editor(
+        previous_render = render_input_editor(
             &mut stdout,
-            previous_rows,
+            previous_render,
             prompt,
             &buffer,
             cursor_index,
@@ -456,7 +456,7 @@ where
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                clear_input_editor(&mut stdout, previous_rows)?;
+                clear_input_editor(&mut stdout, previous_render)?;
                 writeln!(stdout)?;
                 stdout.flush()?;
                 return Ok(TerminalInputResult::Cancelled);
@@ -464,7 +464,7 @@ where
             KeyCode::Char('d')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && buffer.display_count() == 0 =>
             {
-                clear_input_editor(&mut stdout, previous_rows)?;
+                clear_input_editor(&mut stdout, previous_render)?;
                 writeln!(stdout)?;
                 stdout.flush()?;
                 return Ok(TerminalInputResult::Cancelled);
@@ -473,7 +473,7 @@ where
                 if let Some(result) = submit_input_line(
                     SubmitInputContext {
                         stdout: &mut stdout,
-                        previous_rows,
+                        previous_render,
                         prompt,
                         buffer: &mut buffer,
                         cursor_index: &mut cursor_index,
@@ -503,7 +503,7 @@ where
                 if let Some(result) = submit_input_line(
                     SubmitInputContext {
                         stdout: &mut stdout,
-                        previous_rows,
+                        previous_render,
                         prompt,
                         buffer: &mut buffer,
                         cursor_index: &mut cursor_index,
@@ -570,7 +570,7 @@ where
 
 struct SubmitInputContext<'a> {
     stdout: &'a mut std::io::Stdout,
-    previous_rows: usize,
+    previous_render: RenderedInputBlock,
     prompt: &'a str,
     buffer: &'a mut InputLineBuffer,
     cursor_index: &'a mut usize,
@@ -595,7 +595,7 @@ where
             return Ok(None);
         }
     }
-    clear_input_editor(context.stdout, context.previous_rows)?;
+    clear_input_editor(context.stdout, context.previous_render)?;
     writeln!(
         context.stdout,
         "{}{}",
@@ -626,24 +626,42 @@ impl Drop for RawTerminalGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RenderedInputBlock {
+    rows: usize,
+    cursor_row: usize,
+}
+
 fn render_input_editor(
     stdout: &mut std::io::Stdout,
-    previous_rows: usize,
+    previous_render: RenderedInputBlock,
     prompt: &str,
     buffer: &InputLineBuffer,
     cursor_index: usize,
     suggestions: &[InteractiveCompletionSuggestion],
     selected_suggestion_index: Option<usize>,
-) -> std::io::Result<usize> {
-    clear_input_editor(stdout, previous_rows)?;
+) -> std::io::Result<RenderedInputBlock> {
+    clear_input_editor(stdout, previous_render)?;
 
     let width = terminal_width();
+    let display = buffer.rendered_display();
+    if display.starts_with('/') {
+        return render_slash_command_editor(
+            stdout,
+            prompt,
+            &display,
+            cursor_index,
+            suggestions,
+            selected_suggestion_index,
+            width,
+        );
+    }
+
     let suggestion_lines = suggestion_lines(suggestions, selected_suggestion_index, width);
     for line in &suggestion_lines {
         writeln!(stdout, "{line}")?;
     }
 
-    let display = buffer.rendered_display();
     let ghost = ghost_suffix(&display, suggestions, selected_suggestion_index);
     write!(stdout, "{prompt}{display}{}", dimmed(&ghost))?;
 
@@ -657,21 +675,82 @@ fn render_input_editor(
     }
     stdout.flush()?;
 
-    Ok(suggestion_lines.len()
-        + wrapped_line_count(visible_length(prompt) + buffer.display_count(), width))
+    Ok(RenderedInputBlock {
+        rows: suggestion_lines.len()
+            + wrapped_line_count(visible_length(prompt) + buffer.display_count(), width),
+        cursor_row: suggestion_lines.len(),
+    })
 }
 
-fn clear_input_editor(stdout: &mut std::io::Stdout, previous_rows: usize) -> std::io::Result<()> {
-    if previous_rows == 0 {
+fn render_slash_command_editor(
+    stdout: &mut std::io::Stdout,
+    prompt: &str,
+    display: &str,
+    cursor_index: usize,
+    suggestions: &[InteractiveCompletionSuggestion],
+    selected_suggestion_index: Option<usize>,
+    width: usize,
+) -> std::io::Result<RenderedInputBlock> {
+    write!(stdout, "{}{display}", green(prompt))?;
+
+    let suggestion_lines =
+        slash_command_suggestion_lines(suggestions, selected_suggestion_index, width);
+    for line in &suggestion_lines {
+        writeln!(stdout)?;
+        write!(stdout, "{line}")?;
+    }
+
+    let input_length = visible_length(prompt) + visible_length(display);
+    let input_rows = wrapped_line_count(input_length, width);
+    let target_position = wrapped_cursor_position(
+        visible_length(prompt) + cursor_index.min(visible_length(display)),
+        input_length,
+        width,
+    );
+    let current_block_row = input_rows + suggestion_lines.len();
+    let target_block_row = target_position.row;
+    let lines_up = current_block_row.saturating_sub(target_block_row + 1);
+    if lines_up > 0 {
+        queue!(
+            stdout,
+            cursor::MoveUp(lines_up.min(u16::MAX as usize) as u16)
+        )?;
+    }
+    queue!(stdout, cursor::MoveToColumn(0))?;
+    if target_position.column > 0 {
+        queue!(
+            stdout,
+            cursor::MoveRight(target_position.column.min(u16::MAX as usize) as u16)
+        )?;
+    }
+    stdout.flush()?;
+
+    Ok(RenderedInputBlock {
+        rows: input_rows + suggestion_lines.len(),
+        cursor_row: target_position.row,
+    })
+}
+
+fn clear_input_editor(
+    stdout: &mut std::io::Stdout,
+    previous_render: RenderedInputBlock,
+) -> std::io::Result<()> {
+    if previous_render.rows == 0 {
         return Ok(());
     }
 
+    let rows_below_cursor = previous_render
+        .rows
+        .saturating_sub(previous_render.cursor_row + 1);
+    for _ in 0..rows_below_cursor {
+        queue!(stdout, cursor::MoveDown(1))?;
+    }
     queue!(
         stdout,
         cursor::MoveToColumn(0),
         terminal::Clear(ClearType::CurrentLine)
     )?;
-    for _ in 1..previous_rows {
+    for _ in 1..previous_render.rows {
         queue!(
             stdout,
             cursor::MoveUp(1),
@@ -736,6 +815,45 @@ fn suggestion_lines(
     lines
 }
 
+fn slash_command_suggestion_lines(
+    suggestions: &[InteractiveCompletionSuggestion],
+    selected_suggestion_index: Option<usize>,
+    width: usize,
+) -> Vec<String> {
+    if suggestions.is_empty() {
+        return Vec::new();
+    }
+
+    let command_width = suggestions
+        .iter()
+        .map(|suggestion| visible_length(&suggestion.display))
+        .max()
+        .unwrap_or(0)
+        .clamp(12, 28);
+
+    let mut lines = Vec::new();
+    for (index, suggestion) in suggestions.iter().enumerate() {
+        let is_selected = Some(index) == selected_suggestion_index;
+        let marker = if is_selected { "> " } else { "  " };
+        let display = pad_end(
+            &truncate_end(&suggestion.display, command_width),
+            command_width,
+        );
+        let description = if suggestion.description.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", suggestion.description)
+        };
+        let line = format!("{marker}{}{}", yellow(&display, is_selected), description);
+        lines.push(truncate_end(&line, width));
+    }
+    lines.push(truncate_end(
+        &blue("tab complete  arrows select  enter run"),
+        width,
+    ));
+    lines
+}
+
 fn terminal_width() -> usize {
     terminal::size()
         .map(|(columns, _)| usize::from(columns).max(1))
@@ -761,6 +879,10 @@ fn yellow(value: &str, bold: bool) -> String {
 
 fn blue(value: &str) -> String {
     format!("\u{001b}[34m{value}\u{001b}[0m")
+}
+
+fn green(value: &str) -> String {
+    format!("\u{001b}[32m{value}\u{001b}[0m")
 }
 
 fn dimmed(value: &str) -> String {
@@ -885,10 +1007,11 @@ fn remove_char_at(text: &str, offset: usize) -> String {
 mod tests {
     use super::{
         InputCompletionAcceptance, InputCompletionState, InputLineBuffer, WrappedCursorPosition,
-        ghost_suffix, longest_common_prefix, suggestion_window_start, wrapped_cursor_position,
-        wrapped_line_count,
+        ghost_suffix, longest_common_prefix, slash_command_suggestion_lines,
+        suggestion_window_start, wrapped_cursor_position, wrapped_line_count,
     };
     use crate::InteractiveCompletionSuggestion;
+    use crate::terminal::strip_ansi;
 
     fn completion(
         display: &str,
@@ -1039,6 +1162,31 @@ mod tests {
         assert_eq!(ghost_suffix("TEST", &suggestions, Some(1)), "ing rust");
         assert_eq!(ghost_suffix("", &suggestions, None), "");
         assert_eq!(ghost_suffix("missing", &suggestions, None), "");
+    }
+
+    #[test]
+    fn slash_completion_renderer_lists_all_commands_below_prompt_like_swift() {
+        let suggestions = vec![
+            completion("/model", "/model", false, true),
+            completion("/new", "/new", false, true),
+            completion("/help", "/help", false, true),
+            completion("/exit", "/exit", false, true),
+            completion("/resume", "/resume", false, true),
+        ];
+
+        let rendered = slash_command_suggestion_lines(&suggestions, None, 120)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), suggestions.len() + 1);
+        assert!(rendered[0].contains("/model"));
+        assert!(rendered[3].contains("/exit"));
+        assert!(rendered[4].contains("/resume"));
+        assert_eq!(
+            rendered.last().map(String::as_str),
+            Some("tab complete  arrows select  enter run")
+        );
     }
 
     #[test]
