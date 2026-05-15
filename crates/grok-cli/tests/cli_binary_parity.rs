@@ -602,6 +602,46 @@ fn interactive_startup_uses_current_subscription_display_name_like_swift()
 }
 
 #[test]
+fn interactive_forced_tty_flushes_prompt_and_streams_live_like_swift()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("credentials.json"),
+        r#"{"sso":"cookie"}"#,
+    )?;
+    let server = JsonMockServer::spawn(
+        r#"data: {"result":{"conversation":{"conversationId":"conv-live"},"response":{"responseId":"resp-live","token":"Hel"}}}
+data: {"result":{"response":{"responseId":"resp-live","token":"lo"}}}
+data: {"result":{"response":{"modelResponse":{"responseId":"resp-live","message":"Hello"}}}}"#,
+    )?;
+
+    let output = grok()?
+        .env("GROK_CONFIG_DIR", temp_dir.path())
+        .env("GROK_BASE_URL", &server.base_url)
+        .env("GROK_CLI_FORCE_INTERACTIVE_TTY", "1")
+        .args(["chat"])
+        .write_stdin("hello live\n/quit\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output)?;
+    let clean_stdout = grok_cli::terminal::strip_ansi(&stdout);
+    let request = server.recorded_request()?;
+    let body: Value = serde_json::from_str(&request.body)?;
+
+    assert!(clean_stdout.contains("Connected to Grok! Use / for commands, or type help."));
+    assert!(clean_stdout.contains("Grok > Fast | MD"));
+    assert!(clean_stdout.contains("> "));
+    assert!(clean_stdout.contains("\nGrok\nHello"));
+    assert!(clean_stdout.contains("Goodbye!"));
+    assert_eq!(request.path, "/rest/app-chat/conversations/new");
+    assert_eq!(body["message"], "hello live");
+    Ok(())
+}
+
+#[test]
 fn command_help_uses_swift_usage_instead_of_generated_clap_help()
 -> Result<(), Box<dyn std::error::Error>> {
     let message_help = String::from_utf8(

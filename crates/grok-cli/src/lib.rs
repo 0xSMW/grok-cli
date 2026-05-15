@@ -57,7 +57,7 @@ use serde_json::{Map, Value, json};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::io::{BufRead, IsTerminal, Read};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use stream_display::{GrokStreamMarkupParser, StreamDisplayEvent};
@@ -438,6 +438,7 @@ async fn run_chat_command(
         Err(error) => return Ok(format!("Error: {error}")),
     };
 
+    let live_output = is_interactive_terminal() && !parsed.quiet;
     let mut output = Vec::new();
     let mut conversation_id: Option<String> = None;
     let mut parent_response_id: Option<String> = None;
@@ -447,17 +448,18 @@ async fn run_chat_command(
         if !parsed.quiet {
             output.push("Transcribing audio...".to_string());
         }
+        flush_interactive_output(&mut output, live_output);
         match transcribe_required_audio_input(&audio_input, parsed.debug, parsed.quiet).await {
             Ok((_resolved, response)) => {
                 if response.text.trim().is_empty() {
                     output.push("Initial audio did not produce text.".to_string());
-                    return Ok(output.join("\n"));
+                    return Ok(finish_interactive_output(&mut output, live_output));
                 }
                 Some(response.text)
             }
             Err(error) => {
                 output.push(format!("Error: {error}"));
-                return Ok(output.join("\n"));
+                return Ok(finish_interactive_output(&mut output, live_output));
             }
         }
     } else {
@@ -468,23 +470,27 @@ async fn run_chat_command(
         if !parsed.quiet {
             output.push(format!("Sending message: {initial_message}"));
         }
-        let response = send_chat_turn(
+        flush_interactive_output(&mut output, live_output);
+        let response = send_interactive_turn(
             initial_message,
             conversation_id.as_deref(),
             parent_response_id.as_deref(),
             &parsed,
+            live_output,
         )
         .await;
         match response {
             Ok(response) => {
                 conversation_id = Some(response.conversation_id.clone());
                 parent_response_id = Some(response.response_id.clone());
-                output.push(response.message);
+                if !interactive_streaming_live(&parsed, live_output) {
+                    output.push(response.message);
+                }
                 parsed.file_attachment_ids.clear();
             }
             Err(error) => {
                 output.push(format!("Error: {error}"));
-                return Ok(output.join("\n"));
+                return Ok(finish_interactive_output(&mut output, live_output));
             }
         }
     } else if !parsed.quiet {
@@ -496,8 +502,13 @@ async fn run_chat_command(
 
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
-    while let Some(line) = lines.next() {
-        let line = line?;
+    loop {
+        if live_output {
+            output.extend(interactive_status_lines(&parsed));
+        }
+        let Some(line) = read_interactive_line(&mut lines, &mut output, live_output, "> ")? else {
+            break;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -581,8 +592,12 @@ async fn run_chat_command(
                             output.push("Usage: /delete --yes".to_string());
                             continue;
                         }
-                        output.push(DELETE_CONFIRMATION_PROMPT.to_string());
-                        let confirmation = lines.next().transpose()?;
+                        let confirmation = read_interactive_line(
+                            &mut lines,
+                            &mut output,
+                            live_output,
+                            DELETE_CONFIRMATION_PROMPT,
+                        )?;
                         if !is_delete_confirmation(confirmation.as_deref()) {
                             output.push("Delete cancelled.".to_string());
                             continue;
@@ -704,6 +719,7 @@ async fn run_chat_command(
                         &mut parent_response_id,
                         &mut output,
                         GrokConversationListOptions::default(),
+                        live_output,
                     )
                     .await
                     {
@@ -726,6 +742,7 @@ async fn run_chat_command(
                             page_size: 60,
                             search_query: Some(args.join(" ")),
                         },
+                        live_output,
                     )
                     .await
                     {
@@ -782,6 +799,7 @@ async fn run_chat_command(
                             &mut conversation_id,
                             &mut parent_response_id,
                             &mut output,
+                            live_output,
                         )
                         .await
                         {
@@ -800,8 +818,14 @@ async fn run_chat_command(
                     }
                 }
                 "attach" => {
-                    match handle_interactive_attach(&args, &mut lines, &mut parsed, &mut output)
-                        .await
+                    match handle_interactive_attach(
+                        &args,
+                        &mut lines,
+                        &mut parsed,
+                        &mut output,
+                        live_output,
+                    )
+                    .await
                     {
                         Ok(()) => {}
                         Err(error) => output.push(format!("Error: {error}")),
@@ -816,6 +840,7 @@ async fn run_chat_command(
                         &mut parent_response_id,
                         &mut parsed,
                         &mut output,
+                        live_output,
                     )
                     .await
                     {
@@ -833,7 +858,7 @@ async fn run_chat_command(
                         .await,
                     );
                 }
-                "clear" | "cls" => {}
+                "clear" | "cls" => clear_interactive_screen(live_output),
                 _ => output.extend(unknown_interactive_command_lines(command)),
             }
             continue;
@@ -845,11 +870,12 @@ async fn run_chat_command(
             &mut parent_response_id,
             &mut parsed,
             &mut output,
+            live_output,
         )
         .await;
     }
 
-    Ok(output.join("\n"))
+    Ok(finish_interactive_output(&mut output, live_output))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1309,25 +1335,86 @@ async fn interactive_connected_service_name(debug: bool, output: &mut Vec<String
     }
 }
 
+fn finish_interactive_output(output: &mut Vec<String>, live_output: bool) -> String {
+    flush_interactive_output(output, live_output);
+    output.join("\n")
+}
+
+fn flush_interactive_output(output: &mut Vec<String>, live_output: bool) {
+    if !live_output || output.is_empty() {
+        return;
+    }
+
+    for line in output.drain(..) {
+        println!("{line}");
+    }
+    let _ = std::io::stdout().flush();
+}
+
+fn read_interactive_line(
+    lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
+    output: &mut Vec<String>,
+    live_output: bool,
+    prompt: &str,
+) -> Result<Option<String>> {
+    flush_interactive_output(output, live_output);
+    if live_output && !prompt.is_empty() {
+        print!("{prompt}");
+        let _ = std::io::stdout().flush();
+    }
+    Ok(lines.next().transpose()?)
+}
+
+fn clear_interactive_screen(live_output: bool) {
+    if live_output {
+        print!("\u{001b}[2J\u{001b}[H");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn interactive_status_lines(parsed: &ParsedChatCommand) -> Vec<String> {
+    hud::lines(
+        &hud::CliHudState {
+            model_name: parsed.selected_mode.display_name.clone(),
+            workspace_name: parsed.workspace_label.clone(),
+            private_mode: parsed.private_mode,
+            stream: parsed.stream,
+            output_format: if parsed.raw {
+                options::OutputFormat::Raw
+            } else {
+                options::OutputFormat::Markdown
+            },
+            attached_file_count: parsed.file_attachment_ids.len(),
+            rate_limit_warning: None,
+        },
+        120,
+    )
+}
+
 async fn send_interactive_chat_message(
     message: &str,
     conversation_id: &mut Option<String>,
     parent_response_id: &mut Option<String>,
     parsed: &mut ParsedChatCommand,
     output: &mut Vec<String>,
+    live_output: bool,
 ) {
-    let response = send_chat_turn(
+    flush_interactive_output(output, live_output);
+    let response = send_interactive_turn(
         message,
         conversation_id.as_deref(),
         parent_response_id.as_deref(),
         parsed,
+        live_output,
     )
     .await;
     match response {
         Ok(response) => {
             *conversation_id = Some(response.conversation_id.clone());
             *parent_response_id = Some(response.response_id.clone());
-            output.push(response.message);
+            if !interactive_streaming_live(parsed, live_output) {
+                output.push(response.message);
+            }
             parsed.file_attachment_ids.clear();
         }
         Err(error) => handle_interactive_error(&error, parsed.debug, output),
@@ -1380,6 +1467,154 @@ fn is_authentication_error(error: &anyhow::Error) -> bool {
     message_indicates_authentication_failure(&error.to_string())
 }
 
+async fn send_interactive_turn(
+    message: &str,
+    conversation_id: Option<&str>,
+    parent_response_id: Option<&str>,
+    parsed: &ParsedChatCommand,
+    live_output: bool,
+) -> Result<grok_client::ConversationResponse> {
+    if interactive_streaming_live(parsed, live_output) {
+        stream_interactive_chat_turn(message, conversation_id, parent_response_id, parsed).await
+    } else {
+        send_chat_turn(message, conversation_id, parent_response_id, parsed).await
+    }
+}
+
+fn interactive_streaming_live(parsed: &ParsedChatCommand, live_output: bool) -> bool {
+    live_output && parsed.stream && !parsed.quiet
+}
+
+async fn stream_interactive_chat_turn(
+    message: &str,
+    conversation_id: Option<&str>,
+    parent_response_id: Option<&str>,
+    parsed: &ParsedChatCommand,
+) -> Result<grok_client::ConversationResponse> {
+    let client = configured_client(parsed.debug)?;
+    let options = chat_message_options(parsed);
+    let request = match conversation_id {
+        Some(conversation_id) => client.continue_conversation_request(
+            conversation_id,
+            parent_response_id,
+            message,
+            &options,
+        )?,
+        None => client.new_conversation_request(message, &options)?,
+    };
+
+    let mut stream_parser = GrokStreamParser::new(conversation_id.unwrap_or(""));
+    let mut answer_parser = GrokStreamMarkupParser::new();
+    let mut printed_answer_header = false;
+    let mut printed_any_answer = false;
+    let mut accumulated_message = String::new();
+    let mut latest_response = None;
+    let mut final_response = None;
+
+    client
+        .stream_request_lines_with_mode(request, Some(&options.mode_id), |line| {
+            let Some(response) = stream_parser.consume_line(&line)? else {
+                return Ok(());
+            };
+
+            if response.is_final {
+                final_response = Some(response);
+                return Ok(());
+            }
+
+            if !response.is_thinking && !(response.is_soft_stop && response.message.is_empty()) {
+                accumulated_message.push_str(&response.message);
+                printed_any_answer |= print_interactive_stream_events(
+                    answer_parser.consume(&response.message),
+                    &mut printed_answer_header,
+                );
+            }
+            latest_response = Some(response);
+            Ok(())
+        })
+        .await?;
+
+    if final_response.is_none()
+        && let Some(response) = stream_parser.finish()
+    {
+        final_response = Some(response);
+    }
+
+    printed_any_answer |=
+        print_interactive_stream_events(answer_parser.finish(), &mut printed_answer_header);
+
+    if let Some(response) = final_response {
+        if !printed_any_answer {
+            print_interactive_response_body(&response.message, &mut printed_answer_header);
+        }
+        finish_interactive_stream_response(printed_answer_header);
+        return Ok(response);
+    }
+
+    if let Some(response) = latest_response {
+        let response = grok_client::ConversationResponse::final_message(
+            accumulated_message.trim().to_string(),
+            response.conversation_id,
+            response.response_id,
+            None,
+            None,
+            false,
+        );
+        if !printed_any_answer {
+            print_interactive_response_body(&response.message, &mut printed_answer_header);
+        }
+        finish_interactive_stream_response(printed_answer_header);
+        return Ok(response);
+    }
+
+    anyhow::bail!("Could not read Grok streaming response")
+}
+
+fn print_interactive_stream_events(
+    events: Vec<StreamDisplayEvent>,
+    printed_answer_header: &mut bool,
+) -> bool {
+    let mut printed_text = false;
+    for event in events {
+        match event {
+            StreamDisplayEvent::Text(text) if !text.is_empty() => {
+                print_interactive_answer_header(printed_answer_header);
+                print!("{text}");
+                printed_text = true;
+            }
+            StreamDisplayEvent::Text(_) | StreamDisplayEvent::Activity(_) => {}
+        }
+    }
+    if printed_text {
+        let _ = std::io::stdout().flush();
+    }
+    printed_text
+}
+
+fn print_interactive_response_body(message: &str, printed_answer_header: &mut bool) {
+    let visible = GrokStreamMarkupParser::visible_text(message, true);
+    if visible.is_empty() {
+        return;
+    }
+    print_interactive_answer_header(printed_answer_header);
+    print!("{visible}");
+    let _ = std::io::stdout().flush();
+}
+
+fn print_interactive_answer_header(printed_answer_header: &mut bool) {
+    if !*printed_answer_header {
+        println!("\nGrok");
+        *printed_answer_header = true;
+    }
+}
+
+fn finish_interactive_stream_response(printed_answer_header: bool) {
+    if printed_answer_header {
+        println!("\n");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 fn message_indicates_authentication_failure(message: &str) -> bool {
     let normalized = message.to_lowercase();
     normalized.contains("http error: 401")
@@ -1402,6 +1637,7 @@ async fn select_interactive_conversation(
     parent_response_id: &mut Option<String>,
     output: &mut Vec<String>,
     list_options: GrokConversationListOptions,
+    live_output: bool,
 ) -> Result<()> {
     let client = configured_client(parsed.debug)?;
     let response = client.list_conversations_response(&list_options).await?;
@@ -1412,7 +1648,13 @@ async fn select_interactive_conversation(
     }
 
     output.push(conversation_rows(&conversations));
-    let Some(selection) = lines.next().transpose()? else {
+    let Some(selection) = read_interactive_line(
+        lines,
+        output,
+        live_output,
+        "Select a conversation by number: ",
+    )?
+    else {
         return Ok(());
     };
     let selection = selection.trim();
@@ -1451,6 +1693,7 @@ async fn select_interactive_workspace(
     conversation_id: &mut Option<String>,
     parent_response_id: &mut Option<String>,
     output: &mut Vec<String>,
+    live_output: bool,
 ) -> Result<()> {
     let client = configured_client(parsed.debug)?;
     let response = client
@@ -1467,7 +1710,9 @@ async fn select_interactive_workspace(
     }
     output.push(interactive_workspace_selection_rows(&workspaces));
 
-    let Some(selection) = lines.next().transpose()? else {
+    let Some(selection) =
+        read_interactive_line(lines, output, live_output, "Select workspace by number: ")?
+    else {
         return Ok(());
     };
     let selection = selection.trim();
@@ -1516,8 +1761,9 @@ async fn handle_interactive_attach(
     lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
     parsed: &mut ParsedChatCommand,
     output: &mut Vec<String>,
+    live_output: bool,
 ) -> Result<()> {
-    let command = parsed_attach_command(args, lines, parsed.debug, output).await?;
+    let command = parsed_attach_command(args, lines, parsed.debug, output, live_output).await?;
     match command {
         AttachCommand::Select(file_id, label) => {
             append_unique(file_id.clone(), &mut parsed.file_attachment_ids);
@@ -1566,9 +1812,10 @@ async fn parsed_attach_command(
     lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
     debug: bool,
     output: &mut Vec<String>,
+    live_output: bool,
 ) -> Result<AttachCommand> {
     if args.is_empty() || (args.len() == 1 && args[0].eq_ignore_ascii_case("list")) {
-        return select_interactive_attachment(lines, debug, output).await;
+        return select_interactive_attachment(lines, debug, output, live_output).await;
     }
     if args[0].eq_ignore_ascii_case("clear") {
         if args.len() != 1 {
@@ -1592,6 +1839,7 @@ async fn select_interactive_attachment(
     lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
     debug: bool,
     output: &mut Vec<String>,
+    live_output: bool,
 ) -> Result<AttachCommand> {
     let client = configured_client(debug)?;
     let response = client
@@ -1607,7 +1855,9 @@ async fn select_interactive_attachment(
     }
 
     output.push(interactive_attachment_selection_rows(&assets));
-    let Some(selection) = lines.next().transpose()? else {
+    let Some(selection) =
+        read_interactive_line(lines, output, live_output, "Select file by number: ")?
+    else {
         return Ok(AttachCommand::Noop);
     };
     let selection = selection.trim();
@@ -1656,6 +1906,7 @@ async fn handle_interactive_audio(
     parent_response_id: &mut Option<String>,
     parsed: &mut ParsedChatCommand,
     output: &mut Vec<String>,
+    live_output: bool,
 ) -> Result<()> {
     let audio = parse_interactive_audio_command(command, args, parsed)?;
     if audio.input.path.as_deref() == Some("-") {
@@ -1671,9 +1922,15 @@ async fn handle_interactive_audio(
             output.push("Transcribing audio...".to_string());
         }
     }
-    let (_resolved, response) =
-        transcribe_interactive_audio_input(&audio.input, lines, parsed.quiet, output, parsed.debug)
-            .await?;
+    let (_resolved, response) = transcribe_interactive_audio_input(
+        &audio.input,
+        lines,
+        parsed.quiet,
+        output,
+        parsed.debug,
+        live_output,
+    )
+    .await?;
     if !parsed.quiet {
         output.push(interactive_audio_transcript(&response.text));
     }
@@ -1685,7 +1942,7 @@ async fn handle_interactive_audio(
             output.push("Edit transcript, then press Enter to send.".to_string());
         }
         if is_interactive_terminal() {
-            let Some(edited) = lines.next().transpose()? else {
+            let Some(edited) = read_interactive_line(lines, output, live_output, "> ")? else {
                 return Ok(());
             };
             let edited = edited.trim();
@@ -1708,6 +1965,7 @@ async fn handle_interactive_audio(
         parent_response_id,
         parsed,
         output,
+        live_output,
     )
     .await;
     Ok(())
@@ -1779,6 +2037,7 @@ async fn transcribe_interactive_audio_input(
     quiet: bool,
     output: &mut Vec<String>,
     debug: bool,
+    live_output: bool,
 ) -> Result<(ResolvedAudioInput, GrokSpeechToTextResponse)> {
     let parsed = if let Some(path) = input.path.clone() {
         ParsedTranscribeCommand {
@@ -1797,7 +2056,7 @@ async fn transcribe_interactive_audio_input(
                 "Recording creates webm audio; omit --audio-format or use --audio-format webm."
             );
         }
-        let path = record_audio_to_temporary_webm(lines, quiet, output)?;
+        let path = record_audio_to_temporary_webm(lines, quiet, output, live_output)?;
         ParsedTranscribeCommand {
             path,
             audio_format: Some("webm".to_string()),
@@ -1836,6 +2095,7 @@ fn record_audio_to_temporary_webm(
     lines: &mut std::io::Lines<std::io::StdinLock<'_>>,
     quiet: bool,
     output: &mut Vec<String>,
+    live_output: bool,
 ) -> Result<String> {
     let output_path = temporary_audio_recording_path();
     if let Ok(fixture_path) = std::env::var("GROK_CLI_AUDIO_RECORD_FIXTURE")
@@ -1891,10 +2151,12 @@ fn record_audio_to_temporary_webm(
             .spawn()
             .map_err(|error| anyhow::anyhow!("Could not start audio recording: {error}"))?;
 
-        if !quiet {
-            output.push("Press Enter to stop recording...".to_string());
-        }
-        let _ = lines.next().transpose()?;
+        let prompt = if quiet {
+            ""
+        } else {
+            "Press Enter to stop recording... "
+        };
+        let _ = read_interactive_line(lines, output, live_output, prompt)?;
         let child_id = child.id();
         if child.try_wait()?.is_none() && !interrupt_process(child_id) {
             let _ = child.kill();
@@ -1918,7 +2180,7 @@ fn record_audio_to_temporary_webm(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (lines, quiet, output);
+        let _ = (lines, quiet, output, live_output);
         anyhow::bail!(
             "Recording from /audio is currently supported on macOS with ffmpeg installed."
         );
@@ -2100,6 +2362,10 @@ fn interrupt_process(pid: u32) -> bool {
 }
 
 fn is_interactive_terminal() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GROK_CLI_FORCE_INTERACTIVE_TTY").is_some() {
+        return true;
+    }
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
@@ -2530,18 +2796,22 @@ async fn send_chat_turn(
     parsed: &ParsedChatCommand,
 ) -> Result<grok_client::ConversationResponse> {
     let client = configured_client(parsed.debug)?;
-    let options = GrokMessageOptions {
-        temporary: parsed.private_mode,
-        mode_id: parsed.selected_mode.id.clone(),
-        file_attachments: parsed.file_attachment_ids.clone(),
-        workspace_ids: parsed.workspace_ids.clone(),
-        ..GrokMessageOptions::default()
-    };
+    let options = chat_message_options(parsed);
     match conversation_id {
         Some(conversation_id) => Ok(client
             .continue_conversation_response(conversation_id, parent_response_id, message, &options)
             .await?),
         None => Ok(client.send_message_response(message, &options).await?),
+    }
+}
+
+fn chat_message_options(parsed: &ParsedChatCommand) -> GrokMessageOptions {
+    GrokMessageOptions {
+        temporary: parsed.private_mode,
+        mode_id: parsed.selected_mode.id.clone(),
+        file_attachments: parsed.file_attachment_ids.clone(),
+        workspace_ids: parsed.workspace_ids.clone(),
+        ..GrokMessageOptions::default()
     }
 }
 
