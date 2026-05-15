@@ -484,7 +484,7 @@ async fn run_chat_command(
                 conversation_id = Some(response.conversation_id.clone());
                 parent_response_id = Some(response.response_id.clone());
                 if !interactive_streaming_live(&parsed, live_output) {
-                    output.push(response.message);
+                    output.push(message_output_text(&response.message, parsed.raw));
                 }
                 parsed.file_attachment_ids.clear();
             }
@@ -546,7 +546,7 @@ async fn run_chat_command(
                 )
                 .await
                 {
-                    Ok(response) => output.push(response.message),
+                    Ok(response) => output.push(message_output_text(&response.message, parsed.raw)),
                     Err(error) => output.push(format!("Error: {error}")),
                 }
                 continue;
@@ -1543,7 +1543,7 @@ async fn send_interactive_chat_message(
             *conversation_id = Some(response.conversation_id.clone());
             *parent_response_id = Some(response.response_id.clone());
             if !interactive_streaming_live(parsed, live_output) {
-                output.push(response.message);
+                output.push(message_output_text(&response.message, parsed.raw));
             }
             parsed.file_attachment_ids.clear();
         }
@@ -1654,10 +1654,14 @@ async fn stream_interactive_chat_turn(
 
             if !(response.is_thinking || response.is_soft_stop && response.message.is_empty()) {
                 accumulated_message.push_str(&response.message);
-                printed_any_answer |= print_interactive_stream_events(
-                    answer_parser.consume(&response.message),
-                    &mut printed_answer_header,
-                );
+                if parsed.raw {
+                    printed_any_answer |= print_interactive_stream_events(
+                        answer_parser.consume(&response.message),
+                        &mut printed_answer_header,
+                    );
+                } else {
+                    let _ = answer_parser.consume(&response.message);
+                }
             }
             latest_response = Some(response);
             Ok(())
@@ -1670,12 +1674,21 @@ async fn stream_interactive_chat_turn(
         final_response = Some(response);
     }
 
-    printed_any_answer |=
-        print_interactive_stream_events(answer_parser.finish(), &mut printed_answer_header);
+    if parsed.raw {
+        printed_any_answer |=
+            print_interactive_stream_events(answer_parser.finish(), &mut printed_answer_header);
+    } else {
+        let _ = answer_parser.finish();
+    }
 
     if let Some(response) = final_response {
         if !printed_any_answer {
-            print_interactive_response_body(&response.message, &mut printed_answer_header);
+            let message = if response.message.is_empty() {
+                accumulated_message.as_str()
+            } else {
+                response.message.as_str()
+            };
+            print_interactive_response_body(message, parsed.raw, &mut printed_answer_header);
         }
         finish_interactive_stream_response(printed_answer_header);
         return Ok(response);
@@ -1691,7 +1704,11 @@ async fn stream_interactive_chat_turn(
             false,
         );
         if !printed_any_answer {
-            print_interactive_response_body(&response.message, &mut printed_answer_header);
+            print_interactive_response_body(
+                &response.message,
+                parsed.raw,
+                &mut printed_answer_header,
+            );
         }
         finish_interactive_stream_response(printed_answer_header);
         return Ok(response);
@@ -1721,8 +1738,8 @@ fn print_interactive_stream_events(
     printed_text
 }
 
-fn print_interactive_response_body(message: &str, printed_answer_header: &mut bool) {
-    let visible = GrokStreamMarkupParser::visible_text(message, true);
+fn print_interactive_response_body(message: &str, raw: bool, printed_answer_header: &mut bool) {
+    let visible = message_output_text(message, raw);
     if visible.is_empty() {
         return;
     }

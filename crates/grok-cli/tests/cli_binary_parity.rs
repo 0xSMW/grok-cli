@@ -642,6 +642,47 @@ data: {"result":{"response":{"modelResponse":{"responseId":"resp-live","message"
 }
 
 #[test]
+fn interactive_markdown_console_formats_live_response_like_swift()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("credentials.json"),
+        r#"{"sso":"cookie"}"#,
+    )?;
+    let final_message = "**Hello Stephen.**\n\nSee [docs](https://example.com).";
+    let stream_body = format!(
+        "data: {{\"result\":{{\"conversation\":{{\"conversationId\":\"conv-md-live\"}},\"response\":{{\"responseId\":\"resp-md-live\",\"token\":\"**Hello \"}}}}}}\n\
+data: {{\"result\":{{\"response\":{{\"responseId\":\"resp-md-live\",\"token\":\"Stephen.**\\n\\nSee [docs](https://example.com).\"}}}}}}\n\
+data: {{\"result\":{{\"response\":{{\"modelResponse\":{{\"responseId\":\"resp-md-live\",\"message\":{}}}}}}}}}",
+        serde_json::to_string(final_message)?
+    );
+    let server = JsonMockServer::spawn(stream_body)?;
+
+    let output = grok()?
+        .env("GROK_CONFIG_DIR", temp_dir.path())
+        .env("GROK_BASE_URL", &server.base_url)
+        .env("GROK_CLI_FORCE_INTERACTIVE_TTY", "1")
+        .args(["chat"])
+        .write_stdin("hello md\n/quit\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output)?;
+    let clean_stdout = grok_cli::terminal::strip_ansi(&stdout);
+    let request = server.recorded_request()?;
+    let body: Value = serde_json::from_str(&request.body)?;
+
+    assert!(clean_stdout.contains("\nGrok\nHello Stephen.\n\nSee docs."));
+    assert!(!clean_stdout.contains("**Hello Stephen.**"));
+    assert!(!clean_stdout.contains("](https://example.com)"));
+    assert_eq!(request.path, "/rest/app-chat/conversations/new");
+    assert_eq!(body["message"], "hello md");
+    Ok(())
+}
+
+#[test]
 fn command_help_uses_swift_usage_instead_of_generated_clap_help()
 -> Result<(), Box<dyn std::error::Error>> {
     let message_help = String::from_utf8(
