@@ -9385,7 +9385,10 @@ async fn run_auth_command(
             run_auth_import(&import_args, json_requested, quiet_requested)
         }
         "help" => Ok(auth_usage()),
-        "generate" => run_auth_generate(&args[1..], json_requested, quiet_requested),
+        "generate" => {
+            let generate_args = if args.is_empty() { &[] } else { &args[1..] };
+            run_auth_generate(generate_args, json_requested, quiet_requested)
+        }
         unknown => {
             if unknown.starts_with('-') {
                 run_auth_generate(&args, json_requested, quiet_requested)

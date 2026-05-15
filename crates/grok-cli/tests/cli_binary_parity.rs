@@ -2960,6 +2960,43 @@ with open(output, "w") as handle:
 }
 
 #[test]
+fn auth_bare_command_defaults_to_generate_without_panicking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let extractor = temp_dir.path().join("fake_cookie_extractor.py");
+    std::fs::write(
+        &extractor,
+        r#"
+import json
+import sys
+args = sys.argv[1:]
+output = args[args.index("--output") + 1]
+with open(output, "w") as handle:
+    json.dump({"x-anonuserid": "generated", "sso": "cookie"}, handle)
+"#,
+    )?;
+
+    let output = grok()?
+        .env("GROK_CONFIG_DIR", temp_dir.path())
+        .env("GROK_COOKIE_EXTRACTOR", &extractor)
+        .arg("auth")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output)?;
+
+    assert!(stdout.contains("Extracting credentials from browser..."));
+    assert!(stdout.contains("Successfully generated credentials!"));
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.path().join("credentials.json"))?,
+        r#"{"x-anonuserid": "generated", "sso": "cookie"}"#
+    );
+    Ok(())
+}
+
+#[test]
 fn files_list_json_matches_swift_resource_list_contract() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;
