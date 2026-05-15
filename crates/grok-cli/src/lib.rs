@@ -1522,7 +1522,7 @@ async fn stream_interactive_chat_turn(
                 return Ok(());
             }
 
-            if !response.is_thinking && !(response.is_soft_stop && response.message.is_empty()) {
+            if !(response.is_thinking || response.is_soft_stop && response.message.is_empty()) {
                 accumulated_message.push_str(&response.message);
                 printed_any_answer |= print_interactive_stream_events(
                     answer_parser.consume(&response.message),
@@ -1898,6 +1898,7 @@ enum AttachCommand {
     Noop,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_interactive_audio(
     command: &str,
     args: &[&str],
